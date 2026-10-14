@@ -4,8 +4,10 @@ Only a dedicated append-only branch, with deletion/rewrites prohibited for ALL
 writers, provides the expected-head conflict semantics below. Plain Git push is
 not a strict compare-and-swap against an administrator resetting the branch.
 This is neither an execution lease nor a broker retry/reconciliation mechanism.
-It does not store the research archive, solve exit availability, authenticate a
-cloud deployment, or authorize one. Callers must never submit an order until its
+Optional immutable package files can be committed with core state; the separate
+bundle layer must verify archive closure. This store alone does not solve exit
+availability, authenticate a cloud deployment, or authorize one. Callers must
+never submit an order until its
 intent checkpoint is confirmed, and must reconcile its original client_order_id
 after interruption instead of blindly repeating a broker write.
 """
@@ -22,11 +24,16 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import threading
 from urllib.parse import urlsplit
 
 
 CHECKPOINT_PATH = "checkpoint/core-state.json"
 MAX_BYTES = 1024 * 1024
+MAX_BUNDLE_FILE_BYTES = 8 * 1024 * 1024
+MAX_BUNDLE_WRITE_BYTES = 1024 * 1024 * 1024
+ARCHIVE_INDEX_PATH = "checkpoint/archive-index.json"
+_PACKAGE_PATH = re.compile(r"archive/packages/[0-9a-f]{64}/(?:manifest\.json|chunk-[0-9]{6}-[0-9a-f]{64}\.gz)\Z")
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _STATE_FIELDS = frozenset({
@@ -165,6 +172,12 @@ def _oid(value):
     return isinstance(value, str) and _OID.fullmatch(value) is not None
 
 
+def _bundle_path(value):
+    if not isinstance(value, str) or not (value == ARCHIVE_INDEX_PATH or _PACKAGE_PATH.fullmatch(value)):
+        raise CheckpointInvalid("Only the archive index and immutable archive package paths are allowed.")
+    return value
+
+
 class GitCheckpointStore:
     """Explicit load/bootstrap/commit/confirm operations, no automatic initialization.
 
@@ -198,8 +211,10 @@ class GitCheckpointStore:
         self._ref = "refs/heads/" + branch
         self._git_executable = git_executable
         self._timeout = timeout_seconds
+        self._object_cache = None
+        self._cache_lock = threading.RLock()
 
-    def _git(self, directory, *args, data=None):
+    def _git_environment(self):
         env = {key: value for key, value in os.environ.items()
                if not key.upper().startswith(("GIT_", "GCM_TRACE"))}
         env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
@@ -207,6 +222,10 @@ class GitCheckpointStore:
                    GIT_AUTHOR_EMAIL="checkpoint@invalid.example",
                    GIT_COMMITTER_NAME="Checkpoint Writer",
                    GIT_COMMITTER_EMAIL="checkpoint@invalid.example")
+        return env
+
+    def _git(self, directory, *args, data=None):
+        env = self._git_environment()
         try:
             return subprocess.run(
                 [self._git_executable, "-c", "core.hooksPath=" + str(Path(directory) / "no-hooks"),
@@ -225,9 +244,35 @@ class GitCheckpointStore:
 
     @contextmanager
     def _repository(self):
-        with tempfile.TemporaryDirectory(prefix="zoh-checkpoint-") as directory:
-            self._checked(directory, "init", "--quiet")
-            yield directory
+        # Reuse private Git objects within one process. Otherwise every core
+        # save would download the entire archive history again. Every operation
+        # still verifies remote HEAD and exact commit contents; this is not a
+        # cached claim that a previous remote write succeeded.
+        with self._cache_lock:
+            if self._object_cache is None:
+                temporary = tempfile.TemporaryDirectory(prefix="zoh-checkpoint-")
+                try:
+                    self._checked(temporary.name, "init", "--quiet")
+                except Exception:
+                    temporary.cleanup()
+                    raise
+                self._object_cache = temporary
+            yield self._object_cache.name
+
+    def close(self):
+        """Discard this process's private object cache after the cycle/job."""
+        with self._cache_lock:
+            if self._object_cache is not None:
+                self._object_cache.cleanup()
+                self._object_cache = None
+
+    def __del__(self):
+        temporary = getattr(self, "_object_cache", None)
+        if temporary is not None:
+            try:
+                temporary.cleanup()
+            except OSError:
+                pass
 
     def _head(self, directory):
         result = self._git(directory, "ls-remote", "--exit-code", "--", self._remote, self._ref)
@@ -304,27 +349,129 @@ class GitCheckpointStore:
         loaded = self.load()
         if loaded.receipt.commit != receipt.commit:
             raise CheckpointConflict("Remote head differs from the receipt; load and reconcile latest state.")
-        if loaded.receipt != receipt:
+        core_receipt = CheckpointReceipt(receipt.commit, receipt.previous_commit, receipt.state_sha256)
+        if loaded.receipt != core_receipt:
             raise CheckpointCorrupt("Receipt does not match the remote checkpoint content.")
         return loaded
 
-    def bootstrap(self, state):
+    def read_files(self, receipt, paths):
+        """Read exact package bytes only while this receipt remains current.
+
+        Package validity/reference closure is checked by the archive/bundle layer.
+        No working-tree checkout, filters, symlinks or archive extraction is used.
+        """
+        if not isinstance(paths, (list, tuple)):
+            raise CheckpointInvalid("A unique list of archive paths is required.")
+        for path in paths:
+            _bundle_path(path)
+        if len(paths) != len(set(paths)):
+            raise CheckpointInvalid("A unique list of archive paths is required.")
+        self.confirm(receipt)
+        result = {}
+        total = 0
+        with self._repository() as directory:
+            if self._head(directory) != receipt.commit:
+                raise CheckpointConflict("Checkpoint changed before archive readback.")
+            self._fetch(directory, receipt.commit)
+            for path in paths:
+                spec = receipt.commit + ":" + path
+                kind = self._git(directory, "cat-file", "-t", spec)
+                if kind.returncode or kind.stdout.strip() != b"blob":
+                    raise CheckpointCorrupt("Required archive file is missing or invalid.")
+                size = self._checked(directory, "cat-file", "-s", spec)
+                try:
+                    length = int(size.strip())
+                except ValueError:
+                    raise CheckpointCorrupt("Invalid archive file size.") from None
+                limit = MAX_BYTES if path == ARCHIVE_INDEX_PATH else MAX_BUNDLE_FILE_BYTES
+                if not 0 <= length <= limit or total + length > MAX_BUNDLE_WRITE_BYTES:
+                    raise CheckpointCorrupt("Archive readback exceeds its size limit.")
+                content = self._checked(directory, "cat-file", "blob", spec)
+                if len(content) != length:
+                    raise CheckpointCorrupt("Archive file readback was incomplete.")
+                result[path] = content
+                total += length
+            if self._head(directory) != receipt.commit:
+                raise CheckpointConflict("Checkpoint changed during archive readback.")
+        return result
+
+    def prove_files_unchanged(self, receipt, previous_receipt, paths):
+        """Verify immutable Git mode/blob identities across a descendant head.
+
+        This permits reuse of already verified local archive bytes; it does not
+        validate unverified cache contents or make an execution lease.
+        """
+        if not isinstance(paths, (list, tuple)):
+            raise CheckpointInvalid("An explicit list of archive paths is required.")
+        for path in paths:
+            _bundle_path(path)
+        if not isinstance(previous_receipt, CheckpointReceipt) or not _oid(previous_receipt.commit):
+            raise CheckpointInvalid("A previous archive receipt is required.")
+        self.confirm(receipt)
+        with self._repository() as directory:
+            if self._head(directory) != receipt.commit:
+                raise CheckpointConflict("Checkpoint changed before archive lineage check.")
+            self._fetch(directory, receipt.commit)
+            previous_core = CheckpointReceipt(previous_receipt.commit, previous_receipt.previous_commit,
+                                              previous_receipt.state_sha256)
+            if self._read(directory, previous_receipt.commit).receipt != previous_core:
+                raise CheckpointCorrupt("Previous archive receipt did not match its commit.")
+            result = self._git(directory, "merge-base", "--is-ancestor", previous_receipt.commit, receipt.commit)
+            if result.returncode:
+                raise CheckpointConflict("Archive cache is not from an ancestor checkpoint.")
+            def entries(commit):
+                raw = self._checked(directory, "ls-tree", "-r", "-z", commit, "--", "archive/packages/", ARCHIVE_INDEX_PATH)
+                result = {}
+                try:
+                    for line in raw.split(b"\0"):
+                        if not line:
+                            continue
+                        info, name = line.split(b"\t", 1)
+                        mode, kind, object_id = info.decode("ascii").split()
+                        result[name.decode("utf-8")] = (mode, kind, object_id)
+                except (ValueError, UnicodeError):
+                    raise CheckpointCorrupt("Archive Git tree could not be verified.") from None
+                return result
+            old, new = entries(previous_receipt.commit), entries(receipt.commit)
+            for path in paths:
+                if (path not in old or path not in new or old[path] != new[path]
+                        or old[path][:2] != ("100644", "blob")):
+                    raise CheckpointCorrupt("A cached archive file changed or is missing.")
+            if self._head(directory) != receipt.commit:
+                raise CheckpointConflict("Checkpoint changed during archive lineage check.")
+        return True
+
+    def bootstrap(self, state, *, files=None):
         """Explicit store creation from supplied, bound state, only on a missing branch.
 
         This does not create/reset a trading account or migrate a live runtime.
         """
-        return self._write(state, expected_head=None)
+        return self._write(state, expected_head=None, files=files)
 
-    def commit(self, state, *, expected_head):
+    def commit(self, state, *, expected_head, files=None):
         if not _oid(expected_head):
             raise CheckpointInvalid("An explicit valid expected head is required.")
-        return self._write(state, expected_head=expected_head)
+        return self._write(state, expected_head=expected_head, files=files)
 
     def _push(self, directory, commit):
         # Deliberately no +refspec, --force or --force-with-lease.
         return self._git(directory, "push", "--porcelain", "--", self._remote, commit + ":" + self._ref)
 
-    def _write(self, state, expected_head):
+    def _write(self, state, expected_head, files=None):
+        if files is None:
+            files = {}
+        if not isinstance(files, dict):
+            raise CheckpointInvalid("Archive additions must be a path-to-bytes mapping.")
+        additions = dict(files)
+        total = 0
+        for path, data in additions.items():
+            _bundle_path(path)
+            limit = MAX_BYTES if path == ARCHIVE_INDEX_PATH else MAX_BUNDLE_FILE_BYTES
+            if not isinstance(data, bytes) or len(data) > limit:
+                raise CheckpointInvalid("Archive file bytes exceed the allowed size or type.")
+            total += len(data)
+        if total > MAX_BUNDLE_WRITE_BYTES:
+            raise CheckpointInvalid("Archive additions exceed the bounded write size.")
         # Canonicalize/copy before validation, preventing caller mutation mid-write.
         state_bytes = _canonical(state)
         state = json.loads(state_bytes)
@@ -339,6 +486,18 @@ class GitCheckpointStore:
                 self._fetch(directory, expected_head)
                 _transition(self._read(directory, expected_head).state, state)
                 self._checked(directory, "read-tree", expected_head)
+            else:
+                self._checked(directory, "read-tree", "--empty")
+            for path, data in additions.items():
+                if expected_head is not None and path != ARCHIVE_INDEX_PATH:
+                    previous = self._git(directory, "cat-file", "-e", expected_head + ":" + path)
+                    if previous.returncode == 0:
+                        existing = self._checked(directory, "cat-file", "blob", expected_head + ":" + path)
+                        if existing != data:
+                            raise CheckpointInvalid("An existing archive package file cannot be rewritten.")
+                        continue
+                bundle_blob = self._checked(directory, "hash-object", "-w", "--stdin", data=data).decode("ascii").strip()
+                self._checked(directory, "update-index", "--add", "--cacheinfo", "100644", bundle_blob, path)
             blob = self._checked(directory, "hash-object", "-w", "--stdin", data=envelope).decode("ascii").strip()
             self._checked(directory, "update-index", "--add", "--cacheinfo", "100644", blob, CHECKPOINT_PATH)
             tree = self._checked(directory, "write-tree").decode("ascii").strip()

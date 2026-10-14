@@ -19,11 +19,15 @@ exports, private paths or credentials are included. Test data are synthetic.
 
 ## Current boundary
 
-Private-state checkpoint and archive package code are offline foundations.
-Production authentication, durable pre-order integration, outage-safe exits,
-storage capacity validation and the single-executor cutover remain separate
-deployment work. Passing tests does not establish brokerage connectivity or a
-successful cloud migration. Do not run a cloud worker alongside an existing worker.
+Private-state checkpoint, archive bundles, scoped GitHub transport and an opt-in
+execution adapter are tested using synthetic data. The installed trading runner
+does not use these adapters. The source contains no active cloud trading workflow.
+Production runner wiring, secret provisioning, archive capacity/performance,
+brokerage read-only reconciliation and the single-executor cutover remain
+deployment work. An archive-only outage must block entries; a core-state outage
+can also prevent active exits. Existing broker stops do not replace time exits.
+Passing tests does not establish brokerage connectivity or a successful cloud
+migration. Do not run a cloud worker alongside an existing worker.
 
 Run the same tests locally with `python -m unittest discover -s tests -v`.
 On Linux, set LOCALAPPDATA to an empty temporary directory for dashboard imports.

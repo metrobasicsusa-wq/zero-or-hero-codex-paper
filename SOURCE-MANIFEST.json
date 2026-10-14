@@ -21,8 +21,8 @@
     },
     {
       "path": "README.md",
-      "bytes": 1556,
-      "sha256": "4edf5c5d333cd9ca9e2053e7f59abf8756bae90a11ff6ce03f19b9fa97a4aa15"
+      "bytes": 1866,
+      "sha256": "f21f0b0131be78b56dc0fd42bf890b99a1513a30a563e206572999601175361d"
     },
     {
       "path": "run_trader.py",
@@ -60,9 +60,29 @@
       "sha256": "5903f03bb67322731d6fb52c80bef5ad00d601ff845676ae7a8ded29b4a2b1b8"
     },
     {
+      "path": "tests/test_cloud_bundle.py",
+      "bytes": 15800,
+      "sha256": "1e224837d8b6fe8ecd8060bc10f2d21eff77bc788412c0afc95bed4373c7ac23"
+    },
+    {
       "path": "tests/test_cloud_checkpoint.py",
       "bytes": 17445,
       "sha256": "fac7cf2159ef901d5fe130e28a4929d633cbd010ea9cbcd8e36e2e3dca2e22fa"
+    },
+    {
+      "path": "tests/test_cloud_checkpoint_files.py",
+      "bytes": 6314,
+      "sha256": "f6d1614baddd20634032d444dd605d628532c6338951e9eecc8fdf3db84ad9d8"
+    },
+    {
+      "path": "tests/test_cloud_engine.py",
+      "bytes": 18103,
+      "sha256": "d8b4ef4fac41b388273e31b1534409be435a7dac5910f5b96d846b401ef89bae"
+    },
+    {
+      "path": "tests/test_cloud_github.py",
+      "bytes": 4002,
+      "sha256": "de4b526ad17694f5abf7adc76b3f5676130b22d387809d9687c2153e1d9ec807"
     },
     {
       "path": "tests/test_cloud_runtime.py",
@@ -145,9 +165,24 @@
       "sha256": "5680b49cf90d131bcea591908521d63a4d52a5265eb829fa3345af6cfe7c45f4"
     },
     {
+      "path": "zerotrader/cloud_bundle.py",
+      "bytes": 15744,
+      "sha256": "8306a142c91f86c6d3da8f2107637cd9029cd3608f384eb7947510f64015ce99"
+    },
+    {
       "path": "zerotrader/cloud_checkpoint.py",
-      "bytes": 18949,
-      "sha256": "3c3c9511f0ea64f00e7ddc87beada073325edb233eb6a59f8bf4bef6d714f973"
+      "bytes": 27588,
+      "sha256": "7bebe197b8a7527b97697d9190ad211eba831e4cca28d2ed7ff23c632f084eb6"
+    },
+    {
+      "path": "zerotrader/cloud_engine.py",
+      "bytes": 21185,
+      "sha256": "90b35fd63f0dfde209d48c70389a10b058a7cafc702023de51843c7fd27ccf58"
+    },
+    {
+      "path": "zerotrader/cloud_github.py",
+      "bytes": 5167,
+      "sha256": "dc2029773c6cb6071d2d8acc46f3cc3ecf2e611c8887191b299314b58745f0d5"
     },
     {
       "path": "zerotrader/data.py",
