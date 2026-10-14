@@ -1,0 +1,198 @@
+{
+  "format_version": 1,
+  "purpose": "synthetic_offline_ci_only",
+  "source_date": "2026-10-14",
+  "transformations": [
+    {
+      "path": "scripts/build_dashboard.py",
+      "change": "Use a generic Windows user-directory deny pattern."
+    }
+  ],
+  "files": [
+    {
+      "path": ".github/workflows/offline-validation.yml",
+      "bytes": 1002,
+      "sha256": "c9657406ebb6500feee58a8fea6f93adec86fea3905ce9c02501fb77f1f70876"
+    },
+    {
+      "path": ".gitignore",
+      "bytes": 62,
+      "sha256": "fa343eff9670d72cfdf18b3d8a927b864b88187eb83c5806662867ca69e69c8b"
+    },
+    {
+      "path": "README.md",
+      "bytes": 1556,
+      "sha256": "4edf5c5d333cd9ca9e2053e7f59abf8756bae90a11ff6ce03f19b9fa97a4aa15"
+    },
+    {
+      "path": "run_trader.py",
+      "bytes": 74,
+      "sha256": "9cc08f0965dd2f91b5d0707950fc173a3e1a83b6343b1eb7dc638957643370f0"
+    },
+    {
+      "path": "scripts/build_dashboard.py",
+      "bytes": 6537,
+      "sha256": "b2ca13971831f3dcda87b588103ac84cd0464cb9838d4218079bf40d9508e8a9"
+    },
+    {
+      "path": "settings.json",
+      "bytes": 788,
+      "sha256": "459894a5e6a50a34e2b139f9063889623fd060ca445f4d140f48e62b6ad655ad"
+    },
+    {
+      "path": "tests/test_archival.py",
+      "bytes": 8708,
+      "sha256": "57a41d0a7a290b75827fb9c3697a61ec0c1905d286252cfeeb0b83c1bf0dc987"
+    },
+    {
+      "path": "tests/test_archive.py",
+      "bytes": 10979,
+      "sha256": "91b4d75f3bdaf960a84e8c61aa0a8abc387ecf131ac15026b388660050320b5d"
+    },
+    {
+      "path": "tests/test_broker.py",
+      "bytes": 15472,
+      "sha256": "16b965f188a19c86cdc5ac17fb8fe681cc7f25f72fcf758ed8113105b5799d35"
+    },
+    {
+      "path": "tests/test_cloud_archive.py",
+      "bytes": 21141,
+      "sha256": "5903f03bb67322731d6fb52c80bef5ad00d601ff845676ae7a8ded29b4a2b1b8"
+    },
+    {
+      "path": "tests/test_cloud_checkpoint.py",
+      "bytes": 17445,
+      "sha256": "fac7cf2159ef901d5fe130e28a4929d633cbd010ea9cbcd8e36e2e3dca2e22fa"
+    },
+    {
+      "path": "tests/test_cloud_runtime.py",
+      "bytes": 1305,
+      "sha256": "ff043e8a0318090cb9c603eb43eea14fc3ea5ca31f011f28102b027878c06f92"
+    },
+    {
+      "path": "tests/test_dashboard.py",
+      "bytes": 2035,
+      "sha256": "5c673111c96acfe0e17801c8361b57c8e590b0cd4105a69cd6eb4f5ecb801367"
+    },
+    {
+      "path": "tests/test_engine.py",
+      "bytes": 15525,
+      "sha256": "e90e851524de24c79365c7690e292ab8d9a50775558dcf6921710a4a6b8e7a7e"
+    },
+    {
+      "path": "tests/test_engine_audit.py",
+      "bytes": 11486,
+      "sha256": "27a77219d85765985a5d50224c18f61b008a69c73cc0d48325e111cdac7e3741"
+    },
+    {
+      "path": "tests/test_intraday.py",
+      "bytes": 6433,
+      "sha256": "b079433a2a956a693733f314f717f6f5f9b170032a7d95218d57177c1cc9a4c5"
+    },
+    {
+      "path": "tests/test_research_schedule.py",
+      "bytes": 3059,
+      "sha256": "f048d1267c1bad2abae506f2f7d8a6923a3ac0128786c24155dd39083a137a96"
+    },
+    {
+      "path": "tests/test_runner.py",
+      "bytes": 9881,
+      "sha256": "c1994b872fa888c2f802ff3430d993a08aaeec54bdb47771c36264c6554a8e33"
+    },
+    {
+      "path": "tests/test_samples.py",
+      "bytes": 10228,
+      "sha256": "0eef2cb76c6a26fedf8fa1e68ac1197f61d8eece6998e3a755a99720bceabca7"
+    },
+    {
+      "path": "tests/test_swing.py",
+      "bytes": 7610,
+      "sha256": "3d6c09acbff2b5bf1c707048f0e040844a7de2c811fd832db1a4d7d49775e21b"
+    },
+    {
+      "path": "tests/test_worker.py",
+      "bytes": 5153,
+      "sha256": "b43c003681249ea3ad879baa602c49998e9aca78abea328f1d5f9b1e552e9e1c"
+    },
+    {
+      "path": "trader_worker.py",
+      "bytes": 8231,
+      "sha256": "d3bed0587277cbf03084402ff3b6914d4b4ec5abfadb7ec977611d5412d0b463"
+    },
+    {
+      "path": "zerotrader/__init__.py",
+      "bytes": 60,
+      "sha256": "c48adddb5303d65b537163e4896c6b627d59e23ed6cfad57a17fdede6ff666a3"
+    },
+    {
+      "path": "zerotrader/archival.py",
+      "bytes": 4693,
+      "sha256": "e670536584fe86adb148451b78927fb05d795bc90916ff2ef2d0726210178b36"
+    },
+    {
+      "path": "zerotrader/archive.py",
+      "bytes": 17815,
+      "sha256": "0b130817dfaa46eddc56c69d7eb68f83fe9b9f056c1b7a9009191ddb983b70ac"
+    },
+    {
+      "path": "zerotrader/broker.py",
+      "bytes": 20244,
+      "sha256": "97de1a8a2bd9f82cb3d28ec0c980ba7f64a4b3279c07237817dfe67e43b7f84b"
+    },
+    {
+      "path": "zerotrader/cloud_archive.py",
+      "bytes": 27065,
+      "sha256": "5680b49cf90d131bcea591908521d63a4d52a5265eb829fa3345af6cfe7c45f4"
+    },
+    {
+      "path": "zerotrader/cloud_checkpoint.py",
+      "bytes": 18949,
+      "sha256": "3c3c9511f0ea64f00e7ddc87beada073325edb233eb6a59f8bf4bef6d714f973"
+    },
+    {
+      "path": "zerotrader/data.py",
+      "bytes": 1692,
+      "sha256": "4ff0d90da5ebc985f6b21f5f7378c807fad171850955f498c00257694725d707"
+    },
+    {
+      "path": "zerotrader/engine.py",
+      "bytes": 22716,
+      "sha256": "78b438864f0747b875c273721270f1f53c166af45e74b6cc6203e57725046be8"
+    },
+    {
+      "path": "zerotrader/intraday.py",
+      "bytes": 15703,
+      "sha256": "7f0492f70bace1d3dd8618edd61a780b48f1f259516f7bdb08f3d3e390085bdf"
+    },
+    {
+      "path": "zerotrader/report.py",
+      "bytes": 5580,
+      "sha256": "9a95869dd1739020ae6e1ca6a4044ad65016737e17f1ffe766d990d57571087d"
+    },
+    {
+      "path": "zerotrader/risk.py",
+      "bytes": 2771,
+      "sha256": "18d710d8c9b79a726bade35aec44f41d724febb644b616d823089ff68119fa66"
+    },
+    {
+      "path": "zerotrader/runner.py",
+      "bytes": 13921,
+      "sha256": "6ab293a8519b8d5449f78fb03b80108857c172e9defbce5d664b561a1dd51614"
+    },
+    {
+      "path": "zerotrader/samples.py",
+      "bytes": 13719,
+      "sha256": "ab67cf383f6a301a79f8f9f581f7cbf46b7b877ff723114f093b927406c758e0"
+    },
+    {
+      "path": "zerotrader/storage.py",
+      "bytes": 2373,
+      "sha256": "4ebed4ceeef19b40680870e7727c58761e675f52dfcc6a3d07e381b3e1d89345"
+    },
+    {
+      "path": "zerotrader/swing.py",
+      "bytes": 17100,
+      "sha256": "43c6069ea95b28f99b16d7734cfe46615b6c411af17dbad96620cd19018af960"
+    }
+  ]
+}
