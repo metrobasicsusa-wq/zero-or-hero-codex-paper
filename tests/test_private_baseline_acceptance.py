@@ -199,7 +199,11 @@ class PrivateBaselineAcceptanceTests(unittest.TestCase):
             self.assertNotIn(private, output.getvalue())
 
     def test_manual_workflow_exposes_only_state_secret_and_account_hash(self):
-        raw = (Path(__file__).resolve().parents[1] / "cloud-main/private-baseline-acceptance.yml").read_text()
+        root = Path(__file__).resolve().parents[1]
+        workflow = root / ".github/workflows/private-baseline-acceptance.yml"
+        if not workflow.is_file():
+            workflow = root / "cloud-main/private-baseline-acceptance.yml"
+        raw = workflow.read_text()
         self.assertIn("workflow_dispatch:", raw)
         self.assertNotIn("schedule:", raw)
         self.assertNotIn("upload-artifact", raw)
