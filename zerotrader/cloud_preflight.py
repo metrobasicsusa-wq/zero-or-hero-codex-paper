@@ -70,6 +70,8 @@ def _http_read(request, timeout):
 def _result():
     return {"format_version": 1, "status": "failed", "error_category": None,
             "execution_context_verified": False, "credentials_present": False,
+            "paper_key_format_valid": False, "paper_secret_format_valid": False,
+            "state_token_format_valid": False, "account_binding_format_valid": False,
             "paper_endpoint_verified": False, "account_binding_match": False,
             "private_repository_verified": False, "state_contents_read_verified": False,
             "checkpoint_present": False, "archive_index_present": False,
@@ -80,6 +82,12 @@ def _result():
 def _secret(value, *, minimum=1):
     return (isinstance(value, str) and minimum <= len(value) <= 512
             and value.isascii() and all(33 <= ord(char) <= 126 for char in value))
+
+
+def _trim_secret(value):
+    # stdin-based Secret setup can append CRLF. Only outer ASCII whitespace is
+    # tolerated; internal whitespace, non-ASCII and header injection still fail.
+    return value.strip(" \t\r\n\v\f") if isinstance(value, str) else value
 
 
 def _github_read(url, token, transport):
@@ -118,12 +126,18 @@ def run_preflight(*, environ=None, paper_transport=None, github_transport=None):
                 or env.get("GITHUB_REF") != "refs/heads/main"):
             raise _Failure("execution_context_invalid")
         result["execution_context_verified"] = True
-        key, secret, token = (env.get(name) for name in (
+        key, secret, token = (_trim_secret(env.get(name)) for name in (
             "ZOH_MAIN_PAPER_KEY", "ZOH_MAIN_PAPER_SECRET", "ZOH_STATE_GITHUB_TOKEN"))
-        if not _secret(key) or not _secret(secret) or not _secret(token, minimum=20):
+        expected = _trim_secret(env.get("ZOH_EXPECTED_ACCOUNT_SHA256"))
+        result.update(paper_key_format_valid=_secret(key),
+                      paper_secret_format_valid=_secret(secret),
+                      state_token_format_valid=_secret(token, minimum=20),
+                      account_binding_format_valid=(isinstance(expected, str)
+                          and re.fullmatch(r"[0-9a-f]{64}", expected) is not None))
+        if not all(result[name] for name in (
+                "paper_key_format_valid", "paper_secret_format_valid", "state_token_format_valid")):
             raise _Failure("credentials_missing_or_invalid")
-        expected = env.get("ZOH_EXPECTED_ACCOUNT_SHA256")
-        if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+        if not result["account_binding_format_valid"]:
             raise _Failure("account_binding_unavailable")
         result["credentials_present"] = True
 

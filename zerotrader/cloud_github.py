@@ -27,7 +27,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _environment_token():
-    return os.environ.get("ZOH_STATE_GITHUB_TOKEN", "")
+    # Secret provisioning through stdin may retain a terminal line ending.
+    # Only outer ASCII whitespace is normalized; internal/header whitespace
+    # and non-ASCII characters are still rejected by _token().
+    return os.environ.get("ZOH_STATE_GITHUB_TOKEN", "").strip(" \t\r\n\v\f")
 
 
 class PrivateGithubCheckpointStore(GitCheckpointStore):

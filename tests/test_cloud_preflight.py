@@ -120,6 +120,42 @@ class PreflightTests(unittest.TestCase):
                 self.assertEqual(result["error_category"], "account_binding_unavailable")
         self.assertEqual(self.paper.requests, [])
 
+    def test_only_outer_ascii_whitespace_is_normalized_for_all_four_secrets(self):
+        for name in ("ZOH_MAIN_PAPER_KEY", "ZOH_MAIN_PAPER_SECRET", "ZOH_STATE_GITHUB_TOKEN",
+                     "ZOH_EXPECTED_ACCOUNT_SHA256"):
+            self.env[name] = " \t\v\f" + self.env[name] + "\r\n"
+        supplied = dict(self.env)
+        result = self.run_check()
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(self.paper.requests[0].get_header("Apca-api-key-id"), KEY)
+        self.assertEqual(self.paper.requests[0].get_header("Apca-api-secret-key"), SECRET)
+        self.assertEqual(self.github.requests[0].get_header("Authorization"), "Bearer " + TOKEN)
+        self.assertEqual(self.env, supplied)  # Source mapping is never changed.
+        self.assertTrue(all(result[name] for name in (
+            "paper_key_format_valid", "paper_secret_format_valid", "state_token_format_valid",
+            "account_binding_format_valid")))
+        self.assert_public(result)
+
+    def test_internal_whitespace_and_non_ascii_are_not_normalized(self):
+        fields = (("ZOH_MAIN_PAPER_KEY", "paper_key_format_valid"),
+                  ("ZOH_MAIN_PAPER_SECRET", "paper_secret_format_valid"),
+                  ("ZOH_STATE_GITHUB_TOKEN", "state_token_format_valid"),
+                  ("ZOH_EXPECTED_ACCOUNT_SHA256", "account_binding_format_valid"))
+        for name, flag in fields:
+            value = environment()[name]
+            invalid = [value[:10] + middle + value[10:] for middle in (" ", "\t", "\r\n")]
+            invalid.extend(("\u00a0" + value, value + "\u2003"))
+            for index, bad in enumerate(invalid):
+                with self.subTest(name=name, variant=index):
+                    env = environment()
+                    env[name] = bad
+                    result = preflight.run_preflight(environ=env, paper_transport=self.paper,
+                                                     github_transport=self.github)
+                    self.assertFalse(result[flag])
+                    self.assertEqual(result["status"], "failed")
+                    self.assertTrue(all(type(result[field]) is bool for _, field in fields))
+        self.assertEqual(self.paper.requests + self.github.requests, [])
+
     def test_binding_mismatch_never_queries_github_and_never_prints_identifiers(self):
         self.env["ZOH_EXPECTED_ACCOUNT_SHA256"] = "f" * 64
         result = self.run_check()

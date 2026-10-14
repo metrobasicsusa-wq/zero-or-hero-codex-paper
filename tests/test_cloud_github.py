@@ -17,6 +17,14 @@ def metadata():
 
 
 class PrivateGithubTests(unittest.TestCase):
+    def test_environment_terminal_line_ending_only_is_normalized(self):
+        with patch.dict(os.environ, {"ZOH_STATE_GITHUB_TOKEN": TOKEN + "\r\n"}):
+            self.assertEqual(PrivateGithubCheckpointStore()._token(), TOKEN)
+        for invalid in (TOKEN + "\nInjected: bad", TOKEN + "\u00a0"):
+            with patch.dict(os.environ, {"ZOH_STATE_GITHUB_TOKEN": invalid}):
+                with self.assertRaises(CheckpointError):
+                    PrivateGithubCheckpointStore()._token()
+
     def store(self, response=None):
         return PrivateGithubCheckpointStore(credential_loader=lambda: TOKEN,
                                             metadata_transport=lambda request: metadata() if response is None else response)
