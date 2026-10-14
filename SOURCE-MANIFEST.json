@@ -11,8 +11,8 @@
   "files": [
     {
       "path": ".github/workflows/offline-validation.yml",
-      "bytes": 1002,
-      "sha256": "c9657406ebb6500feee58a8fea6f93adec86fea3905ce9c02501fb77f1f70876"
+      "bytes": 1019,
+      "sha256": "b5f254857cb1539f688efc27b3c166396cab6d17edbdfbd8cf7ca500045bd287"
     },
     {
       "path": ".gitignore",
