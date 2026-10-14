@@ -15,6 +15,16 @@
       "sha256": "ab49f2fd62f3d48493179fb9c72aa1aff613506b7c1ef1f9ee47da422aad9b4b"
     },
     {
+      "path": ".github/workflows/cloud-reconcile.yml",
+      "bytes": 1467,
+      "sha256": "e5e62cfc02441dcf0972aed97cc879881e9a5306a98ef222197c85c06121d9f6"
+    },
+    {
+      "path": ".github/workflows/cloud-trading.yml",
+      "bytes": 1866,
+      "sha256": "08891885b25b22b9977c30d8920cc0e5c547412ed1a5deafdc5119f1bd5247b4"
+    },
+    {
       "path": ".github/workflows/offline-validation.yml",
       "bytes": 1019,
       "sha256": "b5f254857cb1539f688efc27b3c166396cab6d17edbdfbd8cf7ca500045bd287"
@@ -31,8 +41,8 @@
     },
     {
       "path": "README.md",
-      "bytes": 2707,
-      "sha256": "7b0d9294b0e1da3f00b913a3a743c97199eaa4ca57c7c7a815ec8546269a2251"
+      "bytes": 2926,
+      "sha256": "ce4a0c9d1de1a56952fcda4656ba92edd7fa743d8f565eb83d596d586db250be"
     },
     {
       "path": "cloud-main/bootstrap_private_state.py",
@@ -58,6 +68,11 @@
       "path": "run_cloud_preflight.py",
       "bytes": 181,
       "sha256": "1c9dbe5de66c5fc0c084ed7278699a2ab9d764d7afd2067464024cda716f2110"
+    },
+    {
+      "path": "run_cloud_reconcile.py",
+      "bytes": 181,
+      "sha256": "01099aec551293716cffe450135db3cabe014fd89e460b2e1514042b4024df6e"
     },
     {
       "path": "run_cloud_trader.py",
@@ -143,6 +158,11 @@
       "path": "tests/test_cloud_preflight.py",
       "bytes": 16886,
       "sha256": "62ce41ff84ef29af106a839b303cc50740ecfb3541e04987b9950382f6539b0d"
+    },
+    {
+      "path": "tests/test_cloud_reconcile.py",
+      "bytes": 18082,
+      "sha256": "874dd44bcec25ca6667791b55c211d07b61925b78cb5f048bc58791412ec1bae"
     },
     {
       "path": "tests/test_cloud_runner.py",
@@ -268,6 +288,11 @@
       "path": "zerotrader/cloud_preflight.py",
       "bytes": 10635,
       "sha256": "a22cd77ecf6efaf964bce6e3313d7b1d22ce15d7137bebe132b1ff027bd2420e"
+    },
+    {
+      "path": "zerotrader/cloud_reconcile.py",
+      "bytes": 22652,
+      "sha256": "ac16d20c6cea4c27fb84e5a968e94cd56790b78f60bf6281c3a2c14ed20a1212"
     },
     {
       "path": "zerotrader/cloud_runner.py",

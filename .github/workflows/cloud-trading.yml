@@ -1,0 +1,48 @@
+# INACTIVE TEMPLATE outside .github/workflows; not installed or enabled.
+# The repository variable ZOH_CLOUD_ENABLED must remain absent/false until
+# verified cutover. Schedule delivery can be delayed or dropped by GitHub.
+name: PAPER cloud executor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 9-16 * * 1-5'
+      timezone: America/New_York
+    - cron: '7,22 17 * * 1-5'
+      timezone: America/New_York
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zoh-main-paper
+  # Default single pending run: newer triggers replace only the waiting run.
+  cancel-in-progress: false
+
+jobs:
+  paper:
+    if: github.repository == 'metrobasicsusa-wq/zero-or-hero-codex-paper' && github.ref == 'refs/heads/main' && vars.ZOH_CLOUD_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    # CLI budget is 300 minutes including cold restore. An active final cycle
+    # may exceed its soft deadline; leave headroom below GitHub's 6-hour limit.
+    timeout-minutes: 355
+    env:
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out reviewed source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - name: Run bound PAPER account after complete private restoration
+        env:
+          ZOH_CLOUD_ENABLED: ${{ vars.ZOH_CLOUD_ENABLED || 'false' }}
+          ZOH_MAIN_PAPER_KEY: ${{ secrets.ZOH_MAIN_PAPER_KEY }}
+          ZOH_MAIN_PAPER_SECRET: ${{ secrets.ZOH_MAIN_PAPER_SECRET }}
+          ZOH_STATE_GITHUB_TOKEN: ${{ secrets.ZOH_STATE_GITHUB_TOKEN }}
+          ZOH_EXPECTED_ACCOUNT_SHA256: ${{ secrets.ZOH_EXPECTED_ACCOUNT_SHA256 }}
+        run: python run_cloud_trader.py --duration-seconds 18000

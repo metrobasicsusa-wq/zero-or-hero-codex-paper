@@ -2,10 +2,12 @@
 
 Independent code-only preparation for a zero-cost GitHub-hosted PAPER experiment.
 Installed workflows are manually triggered synthetic offline testing, private
-baseline cold-restore acceptance, and a separate read-only connection preflight
+baseline cold-restore acceptance, a separate read-only account reconciliation and connection preflight
 on standard Ubuntu runners. Preflight
 uses repository Secrets only to read the bound PAPER account and private state
-repository metadata. No installed workflow executes trading. Cloud trading is not enabled.
+repository metadata. The bounded trading workflow requires an explicit repository
+enable flag and verified private cutover proof. Cloud trading is not enabled by
+publishing code; absent or false enable flags skip its job.
 
 The experiment is limited to Alpaca PAPER US equities, USD100,000 total capital,
 USD50,000 per sleeve and the existing latched 10% observed-peak drawdown rule.
@@ -23,7 +25,8 @@ exports, private paths or credentials are included. Test data are synthetic.
 
 Private-state checkpoints, archive bundles, scoped GitHub transport and the
 opt-in cloud coordinator are tested using synthetic data. The local worker does
-not load this coordinator. No active cloud trading workflow is installed.
+not load this coordinator. The installed cloud trading workflow remains disabled
+until the separately verified, exclusive account cutover.
 The coordinator refuses missing state, absent cutover proof, a different bound
 account, or an uncertain persistence result. Its five-hour duration is checked
 between natural cycles; it is not a hard real-time deadline.

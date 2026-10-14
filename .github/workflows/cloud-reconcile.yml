@@ -1,0 +1,44 @@
+name: PAPER pre-enable read-only reconciliation
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_core_commit:
+        description: Exact reviewed private core-checkpoints commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zoh-main-paper
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: github.repository == 'metrobasicsusa-wq/zero-or-hero-codex-paper' && github.ref == 'refs/heads/main' && vars.ZOH_CLOUD_ENABLED != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out reviewed source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - name: Restore and compare using GET only
+        env:
+          TMPDIR: ${{ runner.temp }}
+          ZOH_CLOUD_ENABLED: 'false'
+          ZOH_EXPECTED_CORE_COMMIT: ${{ inputs.expected_core_commit }}
+          ZOH_MAIN_PAPER_KEY: ${{ secrets.ZOH_MAIN_PAPER_KEY }}
+          ZOH_MAIN_PAPER_SECRET: ${{ secrets.ZOH_MAIN_PAPER_SECRET }}
+          ZOH_STATE_GITHUB_TOKEN: ${{ secrets.ZOH_STATE_GITHUB_TOKEN }}
+          ZOH_EXPECTED_ACCOUNT_SHA256: ${{ secrets.ZOH_EXPECTED_ACCOUNT_SHA256 }}
+        run: python run_cloud_reconcile.py
