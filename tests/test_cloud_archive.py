@@ -361,6 +361,128 @@ class CloudArchiveTests(unittest.TestCase):
         self.assertNotIn(marker, str(caught.exception))
         self.assertNotIn(str(self.root), str(caught.exception))
 
+    def test_verified_cache_extends_without_reinflating_old_market_blobs(self):
+        baseline, first = self.export('cache-baseline')
+        cache = cloud.VerifiedArchiveCache()
+        self.assertEqual(cloud.verify_packages([baseline], cache=cache), first)
+        packages = [baseline]
+        for generation in range(3):
+            self.archive.event(self.run, 'synthetic_cache_append', {'generation': generation})
+            destination = self.root / ('cache-delta-' + str(generation))
+            expected = cloud.export_archive(self.archive.path, destination, parents=packages, cache=cache)
+            # Local preparation forks the model; it does not advance the active
+            # cache before the actual uploaded/downloaded package is verified.
+            self.assertEqual(cloud.verify_packages(packages, cache=cache)['generation'], generation)
+            packages.append(destination)
+            self.assertEqual(cloud.verify_packages(packages, cache=cache), expected)
+        with closing(sqlite3.connect(self.archive.path)) as db:
+            market_blob = db.execute('SELECT payload FROM blobs WHERE sha256=(SELECT blob_hash FROM datasets LIMIT 1)').fetchone()[0]
+        original = cloud._gunzip
+        old_market_checks = []
+
+        def track_inflation(raw, length):
+            if raw == market_blob:
+                old_market_checks.append(length)
+            return original(raw, length)
+
+        with patch.object(cloud, '_gunzip', side_effect=track_inflation):
+            self.assertEqual(cloud.verify_packages(packages), expected)
+        self.assertEqual(len(old_market_checks), 1)  # one initial full cold validation, not once per prefix
+        with patch.object(cloud, '_gunzip', side_effect=AssertionError('Old package was unnecessarily inflated')):
+            self.assertEqual(cloud.verify_packages(packages, cache=cache), expected)
+        target = self.root / 'cached-restored.sqlite3'
+        self.assertEqual(cloud.restore_archive(packages, target, cache=cache), expected)
+        self.assertEqual(cloud._source_snapshot(target), cloud._source_snapshot(self.archive.path))
+
+    def test_cached_source_scan_rejects_old_edits_deletion_and_broken_new_closure(self):
+        self.archive.finish_run(self.run, 'completed')
+        baseline, receipt = self.export('immutable-cache-baseline')
+        cache = cloud.VerifiedArchiveCache()
+        cloud.verify_packages([baseline], cache=cache)
+        cases = ('blob', 'sample', 'source_manifest', 'delete_sample', 'final_run', 'new_fk', 'new_source_ref')
+        for case in cases:
+            with self.subTest(case=case):
+                path = self.root / ('changed-' + case + '.sqlite3')
+                with closing(sqlite3.connect(self.archive.path)) as original:
+                    with closing(sqlite3.connect(path)) as copy:
+                        original.backup(copy)
+                with closing(sqlite3.connect(path)) as db, db:
+                    if case in ('blob', 'source_manifest', 'sample', 'delete_sample'):
+                        table = 'blobs' if case in ('blob', 'source_manifest') else 'samples'
+                        operation = 'delete' if case == 'delete_sample' else 'update'
+                        name = 'immutable_' + table + '_' + operation
+                        trigger = db.execute('SELECT sql FROM sqlite_schema WHERE name=?', (name,)).fetchone()[0]
+                        db.execute('DROP TRIGGER ' + name)
+                        if case == 'blob':
+                            db.execute('UPDATE blobs SET payload=? WHERE sha256=(SELECT blob_hash FROM datasets LIMIT 1)', (b'changed old bytes',))
+                        elif case == 'source_manifest':
+                            db.execute("UPDATE blobs SET kind='changed_old_source' WHERE sha256=(SELECT source_hash FROM runs LIMIT 1)")
+                        elif case == 'sample':
+                            db.execute("UPDATE samples SET decision='changed_old_decision' WHERE sequence=1")
+                        else:
+                            db.execute('DELETE FROM samples WHERE sequence=1')
+                        db.execute(trigger)  # the reviewed schema is restored; old-byte comparison must catch it
+                    elif case == 'final_run':
+                        db.execute("UPDATE runs SET error_json='\"changed_finalized_run\"' WHERE run_id=?", (self.run,))
+                    elif case == 'new_fk':
+                        db.execute('INSERT INTO samples(sample_id,run_id,at,symbol,sleeve,decision,sample_hash) VALUES (?,?,?,?,?,?,?)',
+                                   ('synthetic-new-bad-ref', self.run, self.at, 'SYN', 'swing', 'selected', '0' * 64))
+                    else:
+                        value = {'files': [{'path': 'synthetic.py', 'blob_hash': '0' * 64, 'bytes': 1}]}
+                        raw = cloud._json(value)
+                        packed = gzip.compress(raw, mtime=0)
+                        digest = hashlib.sha256(raw).hexdigest()
+                        db.execute('INSERT INTO blobs VALUES (?,?,?,?,?,?,?)',
+                                   (digest, 'source_manifest', self.at, 'json+gzip', len(raw), len(packed), packed))
+                        db.execute('INSERT INTO runs SELECT ?,action,started_at,NULL,?,config_hash,strategy_hash,?,NULL,NULL FROM runs LIMIT 1',
+                                   ('synthetic-new-broken-source', 'running', digest))
+                destination = self.root / ('rejected-' + case)
+                with self.assertRaises(cloud.ArchivePackageError):
+                    cloud.export_archive(path, destination, parents=[baseline], cache=cache)
+                self.assertFalse(destination.exists())
+                self.assertEqual(cloud.verify_packages([baseline], cache=cache), receipt)
+
+    def test_cache_keeps_run_finalization_original_ids_and_corrected_fill_versions(self):
+        self.event('10.00')
+        baseline, _ = self.export('cache-fill-baseline')
+        cache = cloud.VerifiedArchiveCache()
+        cloud.verify_packages([baseline], cache=cache)
+        self.event('10.05', sleeve='swing')
+        self.archive.finish_run(self.run, 'completed', {'synthetic_equity': 100001})
+        delta = self.root / 'cache-fill-delta'
+        expected = cloud.export_archive(self.archive.path, delta, parents=[baseline], cache=cache)
+        self.assertEqual(cloud.verify_packages([baseline, delta], cache=cache), expected)
+        target = self.root / 'cache-fill-restored.sqlite3'
+        cloud.restore_archive([baseline, delta], target, cache=cache)
+        self.assertEqual(cloud._source_snapshot(target), cloud._source_snapshot(self.archive.path))
+        self.assertEqual([row['activity']['price'] for row in self.decoded_events(target, 'broker_fill_activity')],
+                         ['10.00', '10.05'])
+
+    def test_cache_failure_does_not_advance_and_cached_files_are_still_hash_checked(self):
+        baseline, first = self.export('cache-failure-baseline')
+        cache = cloud.VerifiedArchiveCache()
+        cloud.verify_packages([baseline], cache=cache)
+        self.archive.event(self.run, 'synthetic_more', {'n': 2})
+        delta = self.root / 'cache-failure-delta'
+        expected = cloud.export_archive(self.archive.path, delta, parents=[baseline], cache=cache)
+        original_manifest = (delta / 'manifest.json').read_bytes()
+        wrong = json.loads(original_manifest)
+        wrong['snapshot_sha256'] = '0' * 64
+        self.write_manifest(delta, wrong)
+        with self.assertRaises(cloud.ArchivePackageError):
+            cloud.verify_packages([baseline, delta], cache=cache)
+        self.assertEqual(cloud.verify_packages([baseline], cache=cache), first)
+        (delta / 'manifest.json').write_bytes(original_manifest)
+        self.assertEqual(cloud.verify_packages([baseline, delta], cache=cache), expected)
+        with self.assertRaises(cloud.ArchivePackageError):
+            cloud.verify_packages([baseline], cache=cache)
+        with self.assertRaises(cloud.ArchivePackageError):
+            cloud.verify_packages([baseline, delta, delta], cache=cache)
+        chunk = baseline / self.manifest(baseline)['chunks'][0]['name']
+        chunk.write_bytes(chunk.read_bytes()[:-1])
+        with self.assertRaises(cloud.ArchivePackageError):
+            cloud.verify_packages([baseline, delta], cache=cache)
+
 
 if __name__ == '__main__':
     unittest.main()

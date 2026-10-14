@@ -218,7 +218,7 @@ def prepare_snapshot(runtime, destination):
             lock.__exit__(None, None, None)
         captured = _now()
         archive_path = destination / "archive" / "research.sqlite3"
-        with closing(sqlite3.connect(archive_path.as_uri() + "?mode=ro", uri=True, timeout=0)) as copied:
+        with closing(sqlite3.connect(archive_path.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=0)) as copied:
             copied.execute("PRAGMA query_only=ON")
             copied.execute("PRAGMA trusted_schema=OFF")
             verified = _archive_stats(copied, validate_fills=True)

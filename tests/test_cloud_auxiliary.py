@@ -95,6 +95,7 @@ class CloudAuxiliaryTests(unittest.TestCase):
         for name in ("../latest.json", "/latest.json", "reviews/../latest.json",
                      "reviews//a.txt", "reviews\\a.txt", "C:/latest.json",
                      "reviews/.hidden.txt", "research-history/nested/a.json", "worker.json",
+                     "reviews/__init__.py", "reviews/_helpers.py",
                      "credentials.json", "exports/a.csv", "reviews/a.exe", "latest.json:stream"):
             with self.subTest(name=name):
                 self.assertFalse(allowed_path(name))
@@ -155,14 +156,28 @@ class CloudAuxiliaryTests(unittest.TestCase):
 
     def test_reviewed_attachment_exclusions_are_disclosed_without_reading_bytes(self):
         names = ("reviews/peer-code-synthetic/vendor/example.py",
+                 "reviews/peer-code-synthetic/package/__init__.py",
+                 "reviews/peer-code-synthetic/_package/_helpers.py",
                  "reviews/claude-small-account-review-20261002-164726.json")
         for name in names:
             self.put(name, b"not valid JSON; must not be read")
         self.put("reviews/kept.txt", b"synthetic report")
-        self.capture()
-        result = restore_auxiliary(self.archive.path, self.target)
+        excluded_paths = {self.runtime / name for name in names}
+        original_read_bytes = Path.read_bytes
+
+        def guarded_read_bytes(path):
+            if path in excluded_paths:
+                raise AssertionError("Excluded attachment contents must not be read")
+            return original_read_bytes(path)
+
+        with patch.object(Path, "read_bytes", guarded_read_bytes):
+            self.capture()
+            result = restore_auxiliary(self.archive.path, self.target)
         self.assertEqual({item["path"] for item in result["excluded"]}, set(names))
         self.assertEqual(result["files"], 1)
+        for name in names:
+            self.assertFalse(allowed_path(name))
+            self.assertFalse((self.target / name).exists())
         # A cold runtime lacks the excluded files, but the next manifest keeps
         # their disclosure from the verified archive history.
         for name in names:
@@ -170,6 +185,27 @@ class CloudAuxiliaryTests(unittest.TestCase):
         self.capture()
         again = restore_auxiliary(self.archive.path, self.root / "second-restored")
         self.assertEqual(again["excluded"], result["excluded"])
+
+    def test_invalid_or_unrecognized_exclusion_metadata_fails_before_restore(self):
+        reason = "historical_peer_source_attachment_retained_locally"
+        items = [{"path": name, "reason": reason} for name in (
+            "reviews/peer-code-synthetic/../outside.py",
+            "/reviews/peer-code-synthetic/__init__.py",
+            "C:/reviews/peer-code-synthetic/__init__.py",
+            "reviews/peer-code-synthetic//__init__.py",
+            "reviews\\peer-code-synthetic\\__init__.py",
+            "reviews/peer-code-synthetic/__init__.py:stream",
+            "reviews/not-reviewed/__init__.py",
+            "reviews/peer-code-synthetic/.hidden.py",
+        )]
+        items.append({"path": "reviews/peer-code-synthetic/__init__.py", "reason": "unknown"})
+        for item in items:
+            with self.subTest(item=item):
+                self.archive.event(self.run, MANIFEST_KIND, {
+                    "version": 1, "files": [], "total_bytes": 0, "excluded": [item]})
+                with self.assertRaises(AuxiliaryError):
+                    restore_auxiliary(self.archive.path, self.target)
+                self.assertFalse(self.target.exists())
 
 
 if __name__ == "__main__":

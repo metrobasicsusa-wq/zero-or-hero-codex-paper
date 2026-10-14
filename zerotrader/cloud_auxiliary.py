@@ -28,6 +28,7 @@ _TOP = frozenset({
 _REVIEW_SUFFIXES = frozenset({".json", ".txt", ".md", ".csv", ".py", ".sql"})
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}\Z")
+_EXCLUSION_PART = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,159}\Z")
 MAX_FILE_BYTES = 128 * 1024 * 1024
 MAX_TOTAL_BYTES = 512 * 1024 * 1024
 MAX_FILES = 10000
@@ -55,14 +56,32 @@ def _excluded_reason(name):
     return None
 
 
-def _valid_path_syntax(name):
+def _valid_relative_path(name, part_pattern):
     if not isinstance(name, str) or "\\" in name or ":" in name:
         return False
     path = PurePosixPath(name)
     if path.is_absolute() or path.as_posix() != name or any(
-            part in (".", "..") or not _PART.fullmatch(part) for part in path.parts):
+            part in (".", "..") or not part_pattern.fullmatch(part) for part in path.parts):
         return False
     return True
+
+
+def _valid_path_syntax(name):
+    return _valid_relative_path(name, _PART)
+
+
+def _valid_exclusion(item):
+    """Validate disclosure metadata only; never authorize reading its file.
+
+    Historical Python attachments can contain __init__.py or _helpers.py.
+    Permit those names only inside the existing reviewed exclusion categories;
+    the actual auxiliary file allowlist and its stricter syntax are unchanged.
+    """
+    if (not isinstance(item, dict) or set(item) != {"path", "reason"}
+            or not _valid_relative_path(item["path"], _EXCLUSION_PART)):
+        return False
+    reason = _excluded_reason(item["path"])
+    return reason is not None and reason == item["reason"]
 
 
 def allowed_path(name):
@@ -112,7 +131,10 @@ def _paths(root):
             if path.is_file():
                 reason = _excluded_reason(name)
                 if reason:
-                    excluded.append({"path": name, "reason": reason})
+                    item = {"path": name, "reason": reason}
+                    if not _valid_exclusion(item):
+                        raise AuxiliaryError("Auxiliary exclusion is outside the reviewed exception list.")
+                    excluded.append(item)
                 elif allowed_path(name):
                     result.append(name)
     if len(result) > MAX_FILES:
@@ -186,9 +208,7 @@ def _verified_files(db, manifest):
             or len(manifest["excluded"]) > MAX_FILES):
         raise AuxiliaryError("A verified auxiliary manifest is required.")
     for excluded in manifest["excluded"]:
-        if (not isinstance(excluded, dict) or set(excluded) != {"path", "reason"}
-                or not _valid_path_syntax(excluded["path"]) or not _excluded_reason(excluded["path"])
-                or _excluded_reason(excluded["path"]) != excluded["reason"]):
+        if not _valid_exclusion(excluded):
             raise AuxiliaryError("Auxiliary exclusion is outside the reviewed exception list.")
     result, names, total = [], set(), 0
     for item in manifest["files"]:

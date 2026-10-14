@@ -339,10 +339,15 @@ class CloudBundleTests(unittest.TestCase):
     def test_cached_commit_reads_new_packages_and_proves_old_remote_objects(self):
         initial = self.bootstrap()
         old_prefix = 'archive/packages/' + initial.archive_manifest_sha256 + '/'
+        with closing(sqlite3.connect(self.archive.path)) as db:
+            old_market_blob = db.execute(
+                'SELECT payload FROM blobs WHERE sha256=(SELECT blob_hash FROM datasets LIMIT 1)').fetchone()[0]
         self.archive.event(self.run, 'synthetic_more_evidence', {'n': 2})
-        with patch.object(self.bundle.core, 'read_files', wraps=self.bundle.core.read_files) as reads:
-            with patch.object(self.bundle.core, 'prove_files_unchanged', wraps=self.bundle.core.prove_files_unchanged) as proofs:
+        with patch.object(cloud_archive, '_gunzip', wraps=cloud_archive._gunzip) as inflates:
+            with patch.object(self.bundle.core, 'read_files', wraps=self.bundle.core.read_files) as reads, \
+                    patch.object(self.bundle.core, 'prove_files_unchanged', wraps=self.bundle.core.prove_files_unchanged) as proofs:
                 second = self.bundle.commit(self.state, self.archive.path, expected_head=initial.commit)
+        self.assertFalse(any(call.args[0] == old_market_blob for call in inflates.call_args_list))
         paths = [path for call in reads.call_args_list for path in call.args[1]]
         self.assertTrue(proofs.called)
         self.assertFalse(any(path.startswith(old_prefix) for path in paths))

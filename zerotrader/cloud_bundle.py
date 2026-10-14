@@ -11,9 +11,11 @@ even when its state binding is stale, with entries disabled. It never rolls
 core state back to the older archive or invents missing historical evidence.
 
 Fresh loads read the entire archive. Cached commits can avoid downloading old
-packages when their Git tree identity is proved unchanged. The current archive
-exporter still scans the database and verifies the full LOCAL chain each time;
-memory and work scale with history. No latency, free capacity, authentication,
+packages when their Git tree identity is proved unchanged. A private verified
+model avoids repeatedly inflating old blobs; the source database is still fully
+scanned and old rows compared to detect edits/deletions. Local package hashes
+and every new logical snapshot hash remain checked. Memory/work still scale
+with history. No latency, free capacity, authentication,
 private visibility, execution lease or broker availability is promised here.
 """
 from __future__ import annotations
@@ -165,12 +167,14 @@ class GitBundleStore:
         self._root = Path(self._temporary.name)
         os.chmod(self._root, 0o700)
         self._cache = None
+        self._archive_cache = cloud_archive.VerifiedArchiveCache()
         self._closed = False
 
     def close(self):
         if not self._closed:
             self._temporary.cleanup()
             self._cache = None
+            self._archive_cache = None
             self._closed = True
 
     def __enter__(self):
@@ -271,7 +275,8 @@ class GitBundleStore:
                 raise BundleCorrupt('Core state is newer than its archive evidence; a new bundle is required.')
             reused = self._reuse(receipt, index) if use_cache else []
             self._download(receipt, index['packages'][len(reused):])
-            verified = cloud_archive.verify_packages([self._root / digest for digest in index['packages']])
+            verified = cloud_archive.verify_packages(
+                [self._root / digest for digest in index['packages']], cache=self._archive_cache)
             if any(verified[key] != index[key] for key in ('manifest_sha256', 'snapshot_sha256', 'generation', 'counts')):
                 raise BundleCorrupt('Remote archive does not match its bundle index.')
             # The final check is after local reconstruction, which can be slow.
@@ -343,7 +348,7 @@ class GitBundleStore:
             with tempfile.TemporaryDirectory(prefix='zoh-bundle-export-', dir=self._root) as scratch:
                 package = Path(scratch) / 'package'
                 verified = cloud_archive.export_archive(archive_source, package, parents=parents,
-                                                       chunk_limit=self.chunk_limit)
+                                                       chunk_limit=self.chunk_limit, cache=self._archive_cache)
                 digest = verified['manifest_sha256']
                 manifest_raw = (package / 'manifest.json').read_bytes()
                 manifest = json.loads(manifest_raw)
@@ -394,7 +399,8 @@ class GitBundleStore:
     def _restore_verified(self, target, evidence, counts):
         try:
             restored = cloud_archive.restore_archive(
-                [self._root / digest for digest in self._cache['index']['packages']], target)
+                [self._root / digest for digest in self._cache['index']['packages']], target,
+                cache=self._archive_cache)
             expected = {'manifest_sha256': evidence.archive_manifest_sha256,
                         'snapshot_sha256': evidence.archive_snapshot_sha256,
                         'generation': evidence.generation, 'counts': counts}

@@ -113,7 +113,7 @@ def _reviewed_schema():
             return tuple(tuple(row) for row in _schema(db))
 
 
-def _source_snapshot(path):
+def _source_snapshot(path, *, previous=None):
     path = Path(path)
     if not path.is_file():
         _fail('Source archive must already exist.')
@@ -136,7 +136,7 @@ def _source_snapshot(path):
             if db.execute('PRAGMA integrity_check').fetchall() != [('ok',)] or db.execute('PRAGMA foreign_key_check').fetchall():
                 _fail('Source SQLite integrity checks failed.')
             db.rollback()
-        _validate(result)
+        _validate(result, previous=previous)
         return result
     except (OSError, sqlite3.Error):
         raise ArchivePackageError('Source archive snapshot failed.') from None
@@ -164,7 +164,7 @@ def _index(rows):
     return result
 
 
-def _validate(model):
+def _validate(model, *, previous=None):
     if not isinstance(model, dict) or set(model) != {'schema', 'tables', 'sequences', 'user_version', 'application_id'}:
         _fail('Unsupported logical snapshot layout.')
     schema = model['schema']
@@ -185,12 +185,16 @@ def _validate(model):
             _fail('Unsupported SQLite metadata.')
     if not isinstance(model['tables'], dict) or set(model['tables']) != set(TABLES):
         _fail('Archive table set is incomplete.')
+    # A previously verified model is an in-process trust anchor, not a timestamp
+    # watermark. Compare EVERY old row and all BLOB bytes before reusing it.
+    # This also catches a writer that removed and recreated immutable triggers.
+    changes = _delta(previous, model)['rows'] if previous is not None else model['tables']
     indexed = {}
     for table, columns in TABLES.items():
         rows = model['tables'][table]
         if not isinstance(rows, list):
             _fail('Invalid archive row collection.')
-        for row in rows:
+        for row in changes[table]:
             if not isinstance(row, list) or len(row) != len(columns):
                 _fail('Invalid archive row layout.')
             for value in row:
@@ -209,8 +213,11 @@ def _validate(model):
             if any(not isinstance(value, str) or not value for value in ids) or len(set(ids)) != len(ids):
                 _fail('Duplicate or invalid stable record IDs.')
     blobs = indexed['blobs']
-    decoded = {}
-    for digest, row in blobs.items():
+    decoded_sources = {}
+    runs = indexed['runs']
+    source_hashes = {row[7] for row in changes['runs']}
+    for row in changes['blobs']:
+        digest = row[0]
         if not _HASH.fullmatch(digest) or row[3] != 'json+gzip':
             _fail('Invalid archive blob hash or encoding.')
         binary = _uncell(row[6])
@@ -219,12 +226,21 @@ def _validate(model):
         raw = _gunzip(binary, row[4])
         if _hash(raw) != digest:
             _fail('Archive blob SHA-256 does not match.')
-        decoded[digest] = _parse(raw)
-    runs = indexed['runs']
-    for row in runs.values():
+        value = _parse(raw)
+        if digest in source_hashes:
+            decoded_sources[digest] = value
+        # Large market inputs need canonical/hash verification, not retention of
+        # every decoded JSON object until all other blobs have been processed.
+    for row in changes['runs']:
         if any(row[index] not in blobs for index in (5, 6, 7)) or (row[8] is not None and row[8] not in blobs):
             _fail('Run has a dangling blob reference.')
-        manifest = decoded[row[7]]
+        if row[7] not in decoded_sources:
+            source = blobs[row[7]]
+            raw = _gunzip(_uncell(source[6]), source[4])
+            if _hash(raw) != row[7]:
+                _fail('Source manifest blob SHA-256 does not match.')
+            decoded_sources[row[7]] = _parse(raw)
+        manifest = decoded_sources[row[7]]
         if not isinstance(manifest, dict) or not isinstance(manifest.get('files'), list):
             _fail('Source manifest is invalid.')
         for item in manifest['files']:
@@ -234,7 +250,7 @@ def _validate(model):
                 _fail('Source manifest byte count does not match.')
     for table in ('events', 'samples', 'datasets'):
         blob_column = TABLES[table].index({'events': 'payload_hash', 'samples': 'sample_hash', 'datasets': 'blob_hash'}[table])
-        for row in indexed[table].values():
+        for row in changes[table]:
             if row[2] not in runs or row[blob_column] not in blobs:
                 _fail('Archive contains dangling run or blob references.')
     sequences = model['sequences']
@@ -331,17 +347,61 @@ def _read_package(directory):
     return manifest, payload, _hash(raw)
 
 
-def _chain(packages):
+class VerifiedArchiveCache:
+    """Private in-process verified model; never deserialize a trusted cache.
+
+    Old package files are still SHA-256 checked on reuse. The model is advanced
+    only after all new packages, references and logical snapshot hashes pass.
+    Export works on a fork, so a merely prepared package cannot advance the
+    caller's remote-readback model. This is neither a remote receipt nor a lease.
+    """
+
+    def __init__(self):
+        self._model = None
+        self._identities = []
+
+    def fork(self):
+        other = VerifiedArchiveCache()
+        # Models/rows are private and never mutated after validation. Delta
+        # application creates fresh dictionaries/lists rather than editing them.
+        other._model = self._model
+        other._identities = list(self._identities)
+        return other
+
+
+def _check_cached_package(path, digest, manifest):
+    directory = Path(path)
+    if _hash(_read_file(directory / 'manifest.json', MAX_MANIFEST_BYTES)) != digest:
+        _fail('A previously verified package manifest changed.')
+    for chunk in manifest['chunks']:
+        packed = _read_file(directory / chunk['name'], manifest['chunk_limit'])
+        if len(packed) != chunk['bytes'] or _hash(packed) != chunk['sha256']:
+            _fail('A previously verified package chunk changed.')
+
+
+def _chain(packages, *, cache=None):
     if not packages:
         _fail('A complete baseline package chain is required.')
-    model, last_hash, last_manifest = None, None, None
-    for generation, path in enumerate(packages):
+    if cache is None:
+        cache = VerifiedArchiveCache()
+    if not isinstance(cache, VerifiedArchiveCache):
+        _fail('An in-process verified archive cache is required.')
+    identities = list(cache._identities)
+    if len(packages) < len(identities):
+        _fail('A verified package chain cannot be rewound or truncated.')
+    for path, (digest, manifest) in zip(packages, identities):
+        _check_cached_package(path, digest, manifest)
+    model = cache._model
+    last_hash, last_manifest = identities[-1] if identities else (None, None)
+    for generation in range(len(identities), len(packages)):
+        path = packages[generation]
         manifest, payload, digest = _read_package(path)
         if (manifest['generation'] != generation or manifest['parent'] != last_hash
                 or manifest['kind'] != ('baseline' if generation == 0 else 'incremental')):
             _fail('Archive package chain is missing, reordered, or has the wrong parent.')
         if not isinstance(payload['rows'], dict) or set(payload['rows']) != set(TABLES) or not isinstance(payload['run_before'], dict):
             _fail('Package table set or run-update preconditions are invalid.')
+        prior = model
         if model is None:
             if payload['run_before']:
                 _fail('Baseline cannot contain run-update preconditions.')
@@ -379,21 +439,23 @@ def _chain(packages):
                 merged[table] = sorted(old.values(), key=lambda row: row[0])
             if applied != set(payload['run_before']):
                 _fail('Incremental run-update preconditions are incomplete.')
-            prior = model
             model = dict(model, tables=merged, sequences=payload['sequences'])
-            _validate(model)
-            _delta(prior, model)
-        _validate(model)
+        # Verify the baseline in full once; subsequent generations deeply check
+        # only additions/finalizations after exact immutable-row comparison.
+        _validate(model, previous=prior)
         if _counts(model) != manifest['counts'] or _hash(_json(model)) != manifest['snapshot_sha256']:
             _fail('Reconstructed snapshot hash or row counts do not match.')
         last_hash, last_manifest = digest, manifest
+        identities.append((digest, manifest))
+    cache._model = model
+    cache._identities = identities
     return model, last_hash, last_manifest
 
 
-def verify_packages(packages):
+def verify_packages(packages, *, cache=None):
     """Verify an explicitly ordered local chain; hashes are not authentication."""
     try:
-        model, digest, manifest = _chain(list(packages))
+        model, digest, manifest = _chain(list(packages), cache=cache)
         return {'manifest_sha256': digest, 'snapshot_sha256': manifest['snapshot_sha256'],
                 'generation': manifest['generation'], 'counts': _counts(model)}
     except ArchivePackageError:
@@ -402,7 +464,7 @@ def verify_packages(packages):
         raise ArchivePackageError('Archive package verification failed.') from None
 
 
-def export_archive(source, destination, *, parents=(), chunk_limit=MAX_CHUNK_BYTES):
+def export_archive(source, destination, *, parents=(), chunk_limit=MAX_CHUNK_BYTES, cache=None):
     """Write a new immutable local package; manifest is written LAST.
 
     A failed disk write can leave an incomplete destination without a manifest;
@@ -415,13 +477,16 @@ def export_archive(source, destination, *, parents=(), chunk_limit=MAX_CHUNK_BYT
     if destination.exists():
         _fail('Package destination already exists; immutable packages are never overwritten.')
     try:
-        current = _source_snapshot(source)
         parents = list(parents)
         if parents:
-            previous, parent, parent_manifest = _chain(parents)
+            parent_cache = cache if cache is not None else VerifiedArchiveCache()
+            previous, parent, parent_manifest = _chain(parents, cache=parent_cache)
+            current = _source_snapshot(source, previous=previous)
             payload = _delta(previous, current)
             generation, kind = parent_manifest['generation'] + 1, 'incremental'
         else:
+            parent_cache = VerifiedArchiveCache()
+            current = _source_snapshot(source)
             payload = {'rows': current['tables'], 'run_before': {}, 'sequences': current['sequences']}
             generation, parent, kind = 0, None, 'baseline'
         raw = _json(payload)
@@ -451,7 +516,7 @@ def export_archive(source, destination, *, parents=(), chunk_limit=MAX_CHUNK_BYT
             _write_new(destination / descriptor['name'], chunk)
         _write_new(destination / 'manifest.json', manifest_raw)
         # Exact local readback, not a claim of remote upload or remote durability.
-        return verify_packages(parents + [destination])
+        return verify_packages(parents + [destination], cache=parent_cache.fork())
     except ArchivePackageError:
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, IndexError, OverflowError):
@@ -474,7 +539,7 @@ def _ddl_guard(action, first, second, database, trigger):
     return sqlite3.SQLITE_OK
 
 
-def restore_archive(packages, target):
+def restore_archive(packages, target, *, cache=None):
     """Rebuild baseline plus incrementals at a NEW offline path, never in place.
 
     Repeating restoration to a different new path is deterministic logically.
@@ -486,7 +551,7 @@ def restore_archive(packages, target):
         _fail('Restore target or SQLite sidecars already exist; use a new offline path.')
     temporary = None
     try:
-        model, digest, manifest = _chain(list(packages))
+        model, digest, manifest = _chain(list(packages), cache=cache)
         if not target.parent.is_dir():
             _fail('Restore target parent directory must already exist.')
         handle, temporary = tempfile.mkstemp(prefix='.archive-restore-', suffix='.sqlite3', dir=target.parent)
@@ -513,7 +578,7 @@ def restore_archive(packages, target):
                 db.set_authorizer(None)
                 db.execute('PRAGMA user_version=' + str(model['user_version']))
                 db.execute('PRAGMA application_id=' + str(model['application_id']))
-        rebuilt = _source_snapshot(temporary)
+        rebuilt = _source_snapshot(temporary, previous=model)
         if _hash(_json(rebuilt)) != manifest['snapshot_sha256']:
             _fail('Restored database failed exact logical readback.')
         # Hard-link installation is atomic and fails if target appeared meanwhile;

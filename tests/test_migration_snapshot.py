@@ -77,6 +77,8 @@ class MigrationSnapshotTests(unittest.TestCase):
         self.assertEqual((self.destination / "state.json").read_bytes(), original_state)
         self.assertEqual((self.runtime / "state.json").read_bytes(), original_state)
         self.assertEqual(self.archive.path.read_bytes(), original_archive)
+        self.assertFalse((self.destination / "archive/research.sqlite3-wal").exists())
+        self.assertFalse((self.destination / "archive/research.sqlite3-shm").exists())
         manifest_raw = (self.destination / "manifest.json").read_bytes()
         self.assertEqual(hashlib.sha256(manifest_raw).hexdigest(), result["manifest_sha256"])
         manifest = json.loads(manifest_raw)
