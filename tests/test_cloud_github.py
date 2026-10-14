@@ -17,6 +17,13 @@ def metadata():
 
 
 class PrivateGithubTests(unittest.TestCase):
+    def test_production_only_initial_archive_fetch_gets_longer_allowance(self):
+        store = self.store()
+        self.addCleanup(store.close)
+        self.assertEqual(store._timeout, 30)
+        self.assertEqual(store._initial_fetch_timeout, 180)
+        self.assertFalse(store._initial_fetch_completed)
+
     def test_environment_terminal_line_ending_only_is_normalized(self):
         for framed in (TOKEN + "\r\n", "\ufeff" + TOKEN + "\r\n"):
             with patch.dict(os.environ, {"ZOH_STATE_GITHUB_TOKEN": framed}):

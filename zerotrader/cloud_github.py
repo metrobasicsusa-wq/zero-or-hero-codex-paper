@@ -51,10 +51,12 @@ class PrivateGithubCheckpointStore(GitCheckpointStore):
     """
 
     def __init__(self, *, credential_loader=None, metadata_transport=None,
-                 branch="core-checkpoints", git_executable="git", timeout_seconds=30):
+                 branch="core-checkpoints", git_executable="git", timeout_seconds=30,
+                 initial_fetch_timeout_seconds=180):
         super().__init__("https://github.com/" + STATE_REPOSITORY + ".git",
                          branch=branch, git_executable=git_executable,
-                         timeout_seconds=timeout_seconds)
+                         timeout_seconds=timeout_seconds,
+                         initial_fetch_timeout_seconds=initial_fetch_timeout_seconds)
         self._credential_loader = credential_loader or _environment_token
         self._metadata_transport = metadata_transport or self._http_metadata
 

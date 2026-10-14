@@ -32,7 +32,6 @@ jobs:
       PYTHONDONTWRITEBYTECODE: '1'
       GIT_TERMINAL_PROMPT: '0'
       GIT_LFS_SKIP_SMUDGE: '1'
-      TMPDIR: ${{ runner.temp }}
     steps:
       - name: Check out reviewed code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -44,6 +43,7 @@ jobs:
           python-version: '3.11'
       - name: Restore and verify private offline baseline without trading
         env:
+          TMPDIR: ${{ runner.temp }}
           ZOH_STATE_GITHUB_TOKEN: ${{ secrets.ZOH_STATE_GITHUB_TOKEN }}
           ZOH_EXPECTED_ACCOUNT_SHA256: ${{ secrets.ZOH_EXPECTED_ACCOUNT_SHA256 }}
           ZOH_BASELINE_COMMIT: ${{ inputs.baseline_commit }}

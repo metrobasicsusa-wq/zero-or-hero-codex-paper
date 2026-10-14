@@ -325,5 +325,90 @@ class GitCheckpointTests(unittest.TestCase):
         self.assertNotIn(marker, repr(caught.exception))
 
 
+class InitialFetchTimeoutTests(unittest.TestCase):
+    """Timeout routing only; no network, actual Git or brokerage access."""
+
+    commit = "a" * 40
+
+    def store(self, **kwargs):
+        store = GitCheckpointStore(Path(tempfile.gettempdir()) / "synthetic-cold-fetch.git", **kwargs)
+        self.addCleanup(store.close)
+        return store
+
+    def result(self, args, **kwargs):
+        output = (self.commit + "\n").encode("ascii") if args[5] == "rev-parse" else b""
+        return subprocess.CompletedProcess(args, 0, output, b"")
+
+    def test_only_first_verified_fetch_gets_cold_allowance(self):
+        store = self.store(initial_fetch_timeout_seconds=180)
+        with patch("zerotrader.cloud_checkpoint.subprocess.run", side_effect=self.result) as run:
+            store._git("unused", "push", "synthetic")
+            store._fetch("unused", self.commit)
+            store._fetch("unused", self.commit)
+            store._git("unused", "push", "synthetic")
+        self.assertEqual([(call.args[0][5], call.kwargs["timeout"]) for call in run.call_args_list],
+                         [("push", 30), ("fetch", 180), ("rev-parse", 30),
+                          ("fetch", 30), ("rev-parse", 30), ("push", 30)])
+        self.assertTrue(store._initial_fetch_completed)
+
+    def test_fetch_timeout_does_not_retry_or_change_write_timeout(self):
+        store = self.store(initial_fetch_timeout_seconds=180)
+        with patch("zerotrader.cloud_checkpoint.subprocess.run",
+                   side_effect=subprocess.TimeoutExpired("synthetic-fetch", 180)) as run:
+            with self.assertRaises(CheckpointError):
+                store._fetch("unused", self.commit)
+            self.assertEqual(run.call_count, 1)
+        self.assertFalse(store._initial_fetch_completed)
+        with patch("zerotrader.cloud_checkpoint.subprocess.run", side_effect=self.result) as run:
+            store._git("unused", "push", "synthetic")
+            store._fetch("unused", self.commit)
+        self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [30, 180, 30])
+
+    def test_wrong_fetch_head_does_not_complete_cold_fetch(self):
+        store = self.store(initial_fetch_timeout_seconds=180)
+        with patch("zerotrader.cloud_checkpoint.subprocess.run",
+                   return_value=subprocess.CompletedProcess([], 0, b"b" * 40 + b"\n", b"")):
+            with self.assertRaises(CheckpointCorrupt):
+                store._fetch("unused", self.commit)
+        self.assertFalse(store._initial_fetch_completed)
+
+    def test_close_and_new_object_cache_reset_cold_allowance(self):
+        store = self.store(initial_fetch_timeout_seconds=180)
+        store._initial_fetch_completed = True
+        with patch("zerotrader.cloud_checkpoint.subprocess.run", side_effect=self.result) as run:
+            with store._repository() as first:
+                self.assertFalse(store._initial_fetch_completed)
+                store._fetch(first, self.commit)
+            with store._repository() as same:
+                self.assertEqual(same, first)
+                self.assertTrue(store._initial_fetch_completed)
+                store._fetch(same, self.commit)
+            store.close()
+            self.assertFalse(store._initial_fetch_completed)
+            self.assertIsNone(store._object_cache)
+            with store._repository() as fresh:
+                self.assertNotEqual(fresh, first)
+                self.assertFalse(store._initial_fetch_completed)
+                store._fetch(fresh, self.commit)
+        fetches = [call.kwargs["timeout"] for call in run.call_args_list if call.args[0][5] == "fetch"]
+        self.assertEqual(fetches, [180, 30, 180])
+
+    def test_base_default_and_smaller_initial_allowance_keep_normal_timeout(self):
+        for initial in (None, 5):
+            with self.subTest(initial=initial):
+                store = self.store(initial_fetch_timeout_seconds=initial)
+                with patch("zerotrader.cloud_checkpoint.subprocess.run", side_effect=self.result) as run:
+                    store._fetch("unused", self.commit)
+                self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [30, 30])
+
+    def test_initial_allowance_rejects_invalid_values_without_git(self):
+        for invalid in (0, -1, float("nan"), float("inf"), True, False, "180", object()):
+            with self.subTest(value_type=type(invalid).__name__), \
+                    patch("zerotrader.cloud_checkpoint.subprocess.run") as run:
+                with self.assertRaises(CheckpointInvalid):
+                    self.store(initial_fetch_timeout_seconds=invalid)
+                run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

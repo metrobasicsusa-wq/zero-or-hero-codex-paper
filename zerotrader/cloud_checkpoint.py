@@ -189,7 +189,8 @@ class GitCheckpointStore:
     Raw state goes only to Git's stdin, never command arguments or diagnostics.
     """
 
-    def __init__(self, remote, branch="core-checkpoints", *, git_executable="git", timeout_seconds=30):
+    def __init__(self, remote, branch="core-checkpoints", *, git_executable="git", timeout_seconds=30,
+                 initial_fetch_timeout_seconds=None):
         remote = os.fspath(remote)
         try:
             parsed = urlsplit(remote)
@@ -207,10 +208,16 @@ class GitCheckpointStore:
             raise CheckpointInvalid("Invalid checkpoint branch.")
         if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0 or not math.isfinite(timeout_seconds):
             raise CheckpointInvalid("A finite positive Git timeout is required.")
+        if (initial_fetch_timeout_seconds is not None
+                and (type(initial_fetch_timeout_seconds) not in (int, float)
+                     or initial_fetch_timeout_seconds <= 0 or not math.isfinite(initial_fetch_timeout_seconds))):
+            raise CheckpointInvalid("A finite positive initial fetch timeout is required.")
         self._remote = remote
         self._ref = "refs/heads/" + branch
         self._git_executable = git_executable
         self._timeout = timeout_seconds
+        self._initial_fetch_timeout = initial_fetch_timeout_seconds
+        self._initial_fetch_completed = False
         self._object_cache = None
         self._cache_lock = threading.RLock()
 
@@ -226,11 +233,17 @@ class GitCheckpointStore:
 
     def _git(self, directory, *args, data=None):
         env = self._git_environment()
+        # A fresh private object cache may need to receive the full historical
+        # archive. Give only that initial read-only fetch its separate allowance;
+        # intent/core writes and all other commands retain the normal timeout.
+        timeout = self._timeout
+        if args and args[0] == "fetch" and not self._initial_fetch_completed:
+            timeout = max(timeout, self._initial_fetch_timeout or timeout)
         try:
             return subprocess.run(
                 [self._git_executable, "-c", "core.hooksPath=" + str(Path(directory) / "no-hooks"),
                  "-c", "credential.helper=", *args], cwd=directory, env=env,
-                input=data, capture_output=True, timeout=self._timeout, check=False,
+                input=data, capture_output=True, timeout=timeout, check=False,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
         except (OSError, subprocess.SubprocessError):
@@ -257,6 +270,7 @@ class GitCheckpointStore:
                     temporary.cleanup()
                     raise
                 self._object_cache = temporary
+                self._initial_fetch_completed = False
             yield self._object_cache.name
 
     def close(self):
@@ -265,6 +279,7 @@ class GitCheckpointStore:
             if self._object_cache is not None:
                 self._object_cache.cleanup()
                 self._object_cache = None
+            self._initial_fetch_completed = False
 
     def __del__(self):
         temporary = getattr(self, "_object_cache", None)
@@ -295,6 +310,7 @@ class GitCheckpointStore:
         fetched = self._checked(directory, "rev-parse", "FETCH_HEAD").decode("ascii").strip()
         if fetched != commit:
             raise CheckpointCorrupt("Fetched checkpoint does not match the observed head.")
+        self._initial_fetch_completed = True
 
     def _read(self, directory, commit):
         result = self._git(directory, "show", commit + ":" + CHECKPOINT_PATH)
