@@ -18,9 +18,10 @@ def metadata():
 
 class PrivateGithubTests(unittest.TestCase):
     def test_environment_terminal_line_ending_only_is_normalized(self):
-        with patch.dict(os.environ, {"ZOH_STATE_GITHUB_TOKEN": TOKEN + "\r\n"}):
-            self.assertEqual(PrivateGithubCheckpointStore()._token(), TOKEN)
-        for invalid in (TOKEN + "\nInjected: bad", TOKEN + "\u00a0"):
+        for framed in (TOKEN + "\r\n", "\ufeff" + TOKEN + "\r\n"):
+            with patch.dict(os.environ, {"ZOH_STATE_GITHUB_TOKEN": framed}):
+                self.assertEqual(PrivateGithubCheckpointStore()._token(), TOKEN)
+        for invalid in (TOKEN + "\nInjected: bad", TOKEN + "\u00a0", TOKEN + "\ufeff", "\ufeff\ufeff" + TOKEN):
             with patch.dict(os.environ, {"ZOH_STATE_GITHUB_TOKEN": invalid}):
                 with self.assertRaises(CheckpointError):
                     PrivateGithubCheckpointStore()._token()

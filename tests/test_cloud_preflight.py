@@ -89,6 +89,14 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(self.github.requests[0].get_header("Authorization"), "Bearer " + TOKEN)
         self.assert_public(result)
 
+    def test_single_stdin_byte_order_mark_is_removed_before_validation(self):
+        for name in ("ZOH_MAIN_PAPER_KEY", "ZOH_MAIN_PAPER_SECRET", "ZOH_STATE_GITHUB_TOKEN", "ZOH_EXPECTED_ACCOUNT_SHA256"):
+            self.env[name] = "\ufeff" + self.env[name] + "\r\n"
+        result = self.run_check()
+        self.assertEqual(result["status"], "passed")
+        self.assertTrue(result["account_binding_match"])
+        self.assert_public(result)
+
     def test_untrusted_execution_context_stops_before_credentials_or_network(self):
         for name, value in (("GITHUB_ACTIONS", "false"), ("GITHUB_REPOSITORY", "other/repository"),
                             ("GITHUB_EVENT_NAME", "pull_request_target"), ("GITHUB_REF", "refs/heads/other")):

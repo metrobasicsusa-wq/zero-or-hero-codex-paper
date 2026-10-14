@@ -101,13 +101,13 @@
     },
     {
       "path": "tests/test_cloud_github.py",
-      "bytes": 4498,
-      "sha256": "bb8461a2c0d83e48879034725e5f5c5aef367975df48e9825bb5e065b0560595"
+      "bytes": 4607,
+      "sha256": "52d88394f1c7b9ebd330770ef4fb1d4ad3aa2d5d419d166555fd8ce5280942f4"
     },
     {
       "path": "tests/test_cloud_preflight.py",
-      "bytes": 16438,
-      "sha256": "576f95d118c60104020a14c0fda35d4aa3c905a1fee4e70ae77651701a4fb803"
+      "bytes": 16886,
+      "sha256": "62ce41ff84ef29af106a839b303cc50740ecfb3541e04987b9950382f6539b0d"
     },
     {
       "path": "tests/test_cloud_runtime.py",
@@ -216,13 +216,13 @@
     },
     {
       "path": "zerotrader/cloud_github.py",
-      "bytes": 5402,
-      "sha256": "f5dfe98b125b1a0dfa156c98d9930068e4522cc295b1032cb94b8a0c85c45006"
+      "bytes": 5753,
+      "sha256": "afcceb6b588ee51001392b828e863b0dc25e176155467e420d8ee8b93864f1e6"
     },
     {
       "path": "zerotrader/cloud_preflight.py",
-      "bytes": 10647,
-      "sha256": "e0062705084bef467e97b10da25351908a9397418f4964b800c4662b08fab1e8"
+      "bytes": 10635,
+      "sha256": "a22cd77ecf6efaf964bce6e3313d7b1d22ce15d7137bebe132b1ff027bd2420e"
     },
     {
       "path": "zerotrader/data.py",

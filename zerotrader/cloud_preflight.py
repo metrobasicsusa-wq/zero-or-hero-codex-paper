@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 
 from .broker import PaperBroker
-from .cloud_github import STATE_REPOSITORY
+from .cloud_github import STATE_REPOSITORY, normalize_secret_text
 
 
 CODE_REPOSITORY = "metrobasicsusa-wq/zero-or-hero-codex-paper"
@@ -87,7 +87,7 @@ def _secret(value, *, minimum=1):
 def _trim_secret(value):
     # stdin-based Secret setup can append CRLF. Only outer ASCII whitespace is
     # tolerated; internal whitespace, non-ASCII and header injection still fail.
-    return value.strip(" \t\r\n\v\f") if isinstance(value, str) else value
+    return normalize_secret_text(value)
 
 
 def _github_read(url, token, transport):

@@ -26,11 +26,20 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def normalize_secret_text(value):
+    """Remove stdin framing, never internal whitespace or arbitrary Unicode."""
+    if not isinstance(value, str):
+        return value
+    value = value.strip(" \t\r\n\v\f")
+    # .NET UTF-8 StandardInput writers may emit one initial byte-order mark.
+    return value.removeprefix("\ufeff").strip(" \t\r\n\v\f")
+
+
 def _environment_token():
     # Secret provisioning through stdin may retain a terminal line ending.
     # Only outer ASCII whitespace is normalized; internal/header whitespace
     # and non-ASCII characters are still rejected by _token().
-    return os.environ.get("ZOH_STATE_GITHUB_TOKEN", "").strip(" \t\r\n\v\f")
+    return normalize_secret_text(os.environ.get("ZOH_STATE_GITHUB_TOKEN", ""))
 
 
 class PrivateGithubCheckpointStore(GitCheckpointStore):
