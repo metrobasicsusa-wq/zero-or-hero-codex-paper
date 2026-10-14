@@ -15,11 +15,11 @@ from unittest.mock import patch
 from zerotrader.archive import ResearchArchive
 from zerotrader import cloud_archive
 from zerotrader.cloud_bundle import (
-    BundleCorrupt, BundleError, BundleReceipt, BundleUncertain, GitBundleStore,
+    BundleCorrupt, BundleError, BundleReceipt, BundleUncertain, GitBundleStore, RecoveredBundle,
 )
 from zerotrader.cloud_checkpoint import (
     ARCHIVE_INDEX_PATH, CHECKPOINT_PATH, CheckpointConflict, CheckpointCorrupt,
-    CheckpointError, CheckpointMissing, GitCheckpointStore,
+    CheckpointError, CheckpointInvalid, CheckpointMissing, CheckpointReceipt, GitCheckpointStore,
 )
 
 
@@ -178,6 +178,123 @@ class CloudBundleTests(unittest.TestCase):
         confirmed = self.bundle.commit(state, self.archive.path, expected_head=core_only.commit)
         self.assertEqual(confirmed.previous_commit, core_only.commit)
         self.assertEqual(self.new_bundle().load().state, state)
+
+    def test_recovery_restores_latest_exit_and_risk_then_appends_without_core_rollback(self):
+        initial = self.bootstrap()
+        original_index = self.index(initial)
+        current = deepcopy(self.state)
+        current['equity_peak'] += 500
+        current['last_cycle'] = '2026-01-02T18:00:00Z'
+        current['owners']['SYN']['exit_reason'] = 'synthetic protective exit'
+        current['intents']['synthetic-original-client-id']['order_id'] = 'synthetic-entry-order'
+        exit_id = 'synthetic-original-exit-client-id'
+        current['intents'][exit_id] = {
+            'payload': {'client_order_id': exit_id, 'symbol': 'SYN', 'qty': '2',
+                        'side': 'sell', 'type': 'market', 'time_in_force': 'day'},
+            'sleeve': 'swing', 'status': 'exit_prepared', 'created': '2026-01-02T18:00:00Z',
+            'exit_for': 'synthetic-original-client-id', 'cancel_order_ids': ['synthetic-stop-order'],
+        }
+        prepared = self.core.commit(current, expected_head=initial.commit)
+        current['intents'][exit_id].update(status='filled', order_id='synthetic-exit-order')
+        current['known_order_ids'] = ['synthetic-entry-order', 'synthetic-stop-order', 'synthetic-exit-order']
+        current['fills'] = {'synthetic-exit-order': {'qty': '2', 'price': '9.99'}}
+        latest = self.core.commit(current, expected_head=prepared.commit)
+
+        recovered_runtime = self.root / 'recovered-runtime'
+        target = recovered_runtime / 'archive' / 'research.sqlite3'
+        target.parent.mkdir(parents=True)
+        cold = self.new_bundle()
+        with patch.object(cold.core, '_push', wraps=cold.core._push) as pushes:
+            recovered = cold.restore_recovery(target)
+        self.assertFalse(pushes.called)
+        self.assertIsInstance(recovered, RecoveredBundle)
+        self.assertIs(type(recovered.receipt), CheckpointReceipt)
+        self.assertNotIsInstance(recovered.receipt, BundleReceipt)
+        self.assertTrue(recovered.evidence_stale)
+        self.assertFalse(recovered.entries_allowed)
+        self.assertEqual(recovered.receipt, latest)
+        self.assertEqual(recovered.state, current)
+        self.assertEqual(recovered.archive_state_sha256, initial.state_sha256)
+        self.assertEqual(recovered.archive_manifest_sha256, initial.archive_manifest_sha256)
+        self.assertEqual(recovered.archive_snapshot_sha256, initial.archive_snapshot_sha256)
+        self.assertEqual(cloud_archive._source_snapshot(target), cloud_archive._source_snapshot(self.archive.path))
+        self.assertNotIn(current['account_id'], repr(recovered))
+        with self.assertRaises(BundleError):
+            cold.confirm(recovered.receipt)
+        with self.assertRaises(BundleCorrupt):
+            cold.load()
+        with self.assertRaises(BundleCorrupt):
+            cold.restore(self.root / 'strict-stale.sqlite3')
+        self.assertFalse((self.root / 'strict-stale.sqlite3').exists())
+        unchanged = target.read_bytes()
+        with self.assertRaises(BundleCorrupt):
+            cold.restore_recovery(target)
+        self.assertEqual(target.read_bytes(), unchanged)
+
+        # Recovered state, not the old archive's bound state, must continue the
+        # head. Even an explicit caller mistake cannot remove the durable exit.
+        with self.assertRaises(CheckpointInvalid):
+            cold.commit(self.state, target, expected_head=recovered.receipt.commit)
+        self.assertEqual(self.core.load().state, current)
+        continued = ResearchArchive(recovered_runtime)
+        continued.finish_run(self.run, 'interrupted', {'synthetic_recovery_gap': True})
+        run = continued.start_run('synthetic_reconciliation', {'budget': 100000}, {'period': 20})
+        continued.event(run, 'synthetic_recovery_observation', {'exit': current['intents'][exit_id]})
+        receipt = cold.commit(recovered.state, continued.path, expected_head=recovered.receipt.commit)
+        self.assertIsInstance(receipt, BundleReceipt)
+        self.assertEqual(receipt.previous_commit, latest.commit)
+        self.assertEqual(self.index(receipt)['packages'][:-1], original_index['packages'])
+        loaded = self.new_bundle().restore(self.root / 'resynchronized.sqlite3')
+        self.assertEqual(loaded.state, current)
+        self.assertEqual(loaded.receipt, receipt)
+        self.assertEqual(cloud_archive._source_snapshot(continued.path),
+                         cloud_archive._source_snapshot(self.root / 'resynchronized.sqlite3'))
+
+    def test_recovery_of_synchronized_bundle_still_does_not_issue_entry_receipt(self):
+        initial = self.bootstrap()
+        recovered = self.new_bundle().load_recovery()
+        self.assertFalse(recovered.evidence_stale)
+        self.assertFalse(recovered.entries_allowed)
+        self.assertIs(type(recovered.receipt), CheckpointReceipt)
+        self.assertEqual(recovered.receipt, initial.checkpoint)
+        self.assertEqual(recovered.state, self.state)
+        self.assertNotIsInstance(recovered, BundleReceipt)
+        self.assertFalse(hasattr(recovered.receipt, 'archive_manifest_sha256'))
+        self.assertEqual(self.new_bundle().load().receipt, initial)
+
+    def test_recovery_refuses_missing_corrupt_or_moving_remote_before_target_creation(self):
+        target = self.root / 'refused-recovery.sqlite3'
+        with self.assertRaises(CheckpointMissing):
+            self.new_bundle().restore_recovery(target)
+        self.assertFalse(target.exists())
+        initial = self.bootstrap()
+        current = deepcopy(self.state)
+        current['last_cycle'] = '2026-01-02T18:00:00Z'
+        latest = self.core.commit(current, expected_head=initial.commit)
+        cold = self.new_bundle()
+        original = cold.core.read_files
+        advanced = []
+
+        def move_head_after_download(receipt, paths):
+            result = original(receipt, paths)
+            if any(path.endswith('.gz') for path in paths) and not advanced:
+                current['last_cycle'] = '2026-01-02T18:01:00Z'
+                advanced.append(self.core.commit(current, expected_head=latest.commit))
+            return result
+
+        with patch.object(cold.core, 'read_files', side_effect=move_head_after_download):
+            with self.assertRaises(CheckpointConflict):
+                cold.restore_recovery(target)
+        self.assertFalse(target.exists())
+        manifest_path = 'archive/packages/' + initial.archive_manifest_sha256 + '/manifest.json'
+        self.rewrite(manifest_path, b'corrupt synthetic recovery manifest')
+        with self.assertRaises(BundleCorrupt):
+            self.new_bundle().restore_recovery(target)
+        self.assertFalse(target.exists())
+        self.rewrite(manifest_path, None)
+        with self.assertRaises(CheckpointCorrupt):
+            self.new_bundle().restore_recovery(target)
+        self.assertFalse(target.exists())
 
     def test_remote_missing_chunk_or_corrupt_chunk_fails_before_target_creation(self):
         receipt = self.bootstrap()

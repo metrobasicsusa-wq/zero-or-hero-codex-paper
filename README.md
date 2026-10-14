@@ -1,9 +1,10 @@
 # ZERO OR HERO: PAPER software validation
 
 Independent code-only preparation for a zero-cost GitHub-hosted PAPER experiment.
-The only installed workflow is manually triggered, synthetic offline unit testing
-on a standard Ubuntu runner. It has read-only repository permissions, no account
-secrets, no trading schedule, and no trading command. Cloud trading is not enabled.
+Installed workflows are manually triggered synthetic offline testing and a
+separate read-only connection preflight on standard Ubuntu runners. Preflight
+uses repository Secrets only to read the bound PAPER account and private state
+repository metadata. Neither workflow executes trading. Cloud trading is not enabled.
 
 The experiment is limited to Alpaca PAPER US equities, USD100,000 total capital,
 USD50,000 per sleeve and the existing latched 10% observed-peak drawdown rule.
@@ -22,7 +23,7 @@ exports, private paths or credentials are included. Test data are synthetic.
 Private-state checkpoint, archive bundles, scoped GitHub transport and an opt-in
 execution adapter are tested using synthetic data. The installed trading runner
 does not use these adapters. The source contains no active cloud trading workflow.
-Production runner wiring, secret provisioning, archive capacity/performance,
+Production runner wiring, archive capacity/performance,
 brokerage read-only reconciliation and the single-executor cutover remain
 deployment work. An archive-only outage must block entries; a core-state outage
 can also prevent active exits. Existing broker stops do not replace time exits.

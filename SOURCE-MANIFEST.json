@@ -1,6 +1,6 @@
 {
   "format_version": 1,
-  "purpose": "synthetic_offline_ci_only",
+  "purpose": "offline_tests_and_readonly_connection_preflight",
   "source_date": "2026-10-14",
   "transformations": [
     {
@@ -9,6 +9,11 @@
     }
   ],
   "files": [
+    {
+      "path": ".github/workflows/cloud-preflight.yml",
+      "bytes": 1168,
+      "sha256": "ab49f2fd62f3d48493179fb9c72aa1aff613506b7c1ef1f9ee47da422aad9b4b"
+    },
     {
       "path": ".github/workflows/offline-validation.yml",
       "bytes": 1019,
@@ -21,8 +26,13 @@
     },
     {
       "path": "README.md",
-      "bytes": 1866,
-      "sha256": "f21f0b0131be78b56dc0fd42bf890b99a1513a30a563e206572999601175361d"
+      "bytes": 1916,
+      "sha256": "a366d2e487557f5380895acc9fa6484159d28e4d3a61eb8f0c7b7dc5cfdad8ad"
+    },
+    {
+      "path": "run_cloud_preflight.py",
+      "bytes": 181,
+      "sha256": "1c9dbe5de66c5fc0c084ed7278699a2ab9d764d7afd2067464024cda716f2110"
     },
     {
       "path": "run_trader.py",
@@ -61,8 +71,8 @@
     },
     {
       "path": "tests/test_cloud_bundle.py",
-      "bytes": 15800,
-      "sha256": "1e224837d8b6fe8ecd8060bc10f2d21eff77bc788412c0afc95bed4373c7ac23"
+      "bytes": 22702,
+      "sha256": "05c4262d756a25bd038787ef3d4ae5671afb5067865522e32c10d7007395744d"
     },
     {
       "path": "tests/test_cloud_checkpoint.py",
@@ -83,6 +93,11 @@
       "path": "tests/test_cloud_github.py",
       "bytes": 4002,
       "sha256": "de4b526ad17694f5abf7adc76b3f5676130b22d387809d9687c2153e1d9ec807"
+    },
+    {
+      "path": "tests/test_cloud_preflight.py",
+      "bytes": 14188,
+      "sha256": "882af6a13b135e61edc09f2bc7b6fb43a131370cd6b4883467b210d66b86ecc8"
     },
     {
       "path": "tests/test_cloud_runtime.py",
@@ -166,8 +181,8 @@
     },
     {
       "path": "zerotrader/cloud_bundle.py",
-      "bytes": 15744,
-      "sha256": "8306a142c91f86c6d3da8f2107637cd9029cd3608f384eb7947510f64015ce99"
+      "bytes": 18881,
+      "sha256": "ca624e8be40ce3f090bbe5583b4971690476c74f3191a5d71dda5ca9a587f217"
     },
     {
       "path": "zerotrader/cloud_checkpoint.py",
@@ -183,6 +198,11 @@
       "path": "zerotrader/cloud_github.py",
       "bytes": 5167,
       "sha256": "dc2029773c6cb6071d2d8acc46f3cc3ecf2e611c8887191b299314b58745f0d5"
+    },
+    {
+      "path": "zerotrader/cloud_preflight.py",
+      "bytes": 9806,
+      "sha256": "214fdcdca5d19a014e2a26b892a052849649b2dd4838041e5ffba8d666958e5c"
     },
     {
       "path": "zerotrader/data.py",

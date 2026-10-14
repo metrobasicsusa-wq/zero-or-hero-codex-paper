@@ -6,6 +6,9 @@ BEFORE invoking the entry barrier with this store. This module verifies durable
 bytes and archive closure, not the trading meaning/completeness of those inputs.
 Core-only protective-exit checkpoints may advance independently; they do not
 produce entry evidence receipts. One coordinator must serialize both writers.
+Explicit recovery returns the latest core plus the complete verified archive,
+even when its state binding is stale, with entries disabled. It never rolls
+core state back to the older archive or invents missing historical evidence.
 
 Fresh loads read the entire archive. Cached commits can avoid downloading old
 packages when their Git tree identity is proved unchanged. The current archive
@@ -69,6 +72,36 @@ class LoadedBundle:
     receipt: BundleReceipt
     state: dict = field(repr=False)
     counts: dict
+
+
+@dataclass(frozen=True)
+class RecoveredBundle:
+    """Verified recovery inputs, deliberately not an entry/barrier receipt.
+
+    receipt is always a plain core receipt. archive_state_sha256 identifies the
+    state to which the old archive index was bound; state and receipt describe
+    the latest core. Reconcile from that current state and append new evidence
+    before obtaining a new strict BundleReceipt. Matching hashes alone do not
+    authorize entry when this recovery API is used. evidence_stale compares core
+    state bindings; it makes no claim about market-data freshness or coverage.
+    """
+
+    receipt: CheckpointReceipt
+    state: dict = field(repr=False)
+    counts: dict
+    archive_state_sha256: str
+    archive_manifest_sha256: str
+    archive_snapshot_sha256: str
+    archive_index_sha256: str
+    generation: int
+
+    @property
+    def evidence_stale(self):
+        return self.archive_state_sha256 != self.receipt.state_sha256
+
+    @property
+    def entries_allowed(self):
+        return False
 
 
 def _json(value):
@@ -244,6 +277,13 @@ class GitBundleStore:
             # The final check is after local reconstruction, which can be slow.
             self.core.confirm(receipt)
             self._cache = {'receipt': receipt, 'index': index, 'raw': raw}
+            if allow_stale_index:
+                # Even internal recovery must not mint a BundleReceipt whose
+                # core hash differs from the archive's evidence binding.
+                return RecoveredBundle(
+                    CheckpointReceipt(receipt.commit, receipt.previous_commit, receipt.state_sha256),
+                    loaded.state, dict(verified['counts']), index['state_sha256'],
+                    index['manifest_sha256'], index['snapshot_sha256'], _hash(raw), index['generation'])
             bundle = BundleReceipt(receipt.commit, receipt.previous_commit, receipt.state_sha256,
                                    index['manifest_sha256'], index['snapshot_sha256'], _hash(raw), index['generation'])
             return LoadedBundle(bundle, loaded.state, dict(verified['counts']))
@@ -255,6 +295,15 @@ class GitBundleStore:
     def load(self):
         """Fresh complete remote readback. Never creates or resets missing state."""
         return self._read()
+
+    def load_recovery(self):
+        """Read latest core and the full archive, with entries always disabled.
+
+        A stale state binding is explicitly reported rather than treated as
+        corruption or permission to reset the core. Missing/corrupt archive
+        files still fail, and a moving remote head is never accepted.
+        """
+        return self._read(allow_stale_index=True)
 
     def confirm(self, receipt):
         """Confirm the exact current bundle; an advanced head is a conflict."""
@@ -326,11 +375,30 @@ class GitBundleStore:
         describes this commit's snapshot, not an execution lease after return.
         """
         loaded = self.load()
+        self._restore_verified(target, loaded.receipt, loaded.counts)
+        return loaded
+
+    def restore_recovery(self, target):
+        """Restore the complete old archive to a NEW path and return latest core.
+
+        The core is returned unchanged, not replaced by the archive's older
+        state binding. This result never enables entries. The coordinator must
+        reconcile current core/broker state and write current evidence before
+        committing a new bundle using recovered.receipt.commit as expected_head.
+        Missing historical samples cannot be reconstructed by this operation.
+        """
+        recovered = self.load_recovery()
+        self._restore_verified(target, recovered, recovered.counts)
+        return recovered
+
+    def _restore_verified(self, target, evidence, counts):
         try:
             restored = cloud_archive.restore_archive(
                 [self._root / digest for digest in self._cache['index']['packages']], target)
-            if restored['snapshot_sha256'] != loaded.receipt.archive_snapshot_sha256:
+            expected = {'manifest_sha256': evidence.archive_manifest_sha256,
+                        'snapshot_sha256': evidence.archive_snapshot_sha256,
+                        'generation': evidence.generation, 'counts': counts}
+            if restored != expected:
                 raise BundleCorrupt('Restored archive differs from the verified bundle.')
         except cloud_archive.ArchivePackageError:
             raise BundleCorrupt('Bundle archive restoration failed.') from None
-        return loaded
