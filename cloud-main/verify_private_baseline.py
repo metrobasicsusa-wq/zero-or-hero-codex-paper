@@ -139,10 +139,7 @@ def _manifest(raw, expected_hash):
         if not isinstance(value["auxiliary_excluded"], list):
             raise ValueError
         for item in value["auxiliary_excluded"]:
-            if (not isinstance(item, dict) or set(item) != {"path", "reason"}
-                    or not cloud_auxiliary._valid_path_syntax(item["path"])
-                    or not cloud_auxiliary._excluded_reason(item["path"])
-                    or cloud_auxiliary._excluded_reason(item["path"]) != item["reason"]):
+            if not cloud_auxiliary._valid_exclusion(item):
                 raise ValueError
         return value
     except Exception:

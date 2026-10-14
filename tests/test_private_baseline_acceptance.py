@@ -156,6 +156,24 @@ class PrivateBaselineAcceptanceTests(unittest.TestCase):
             with self.subTest(case=case), self.assertRaises(acceptance.AcceptanceError):
                 acceptance._manifest(raw, hashlib.sha256(raw).hexdigest())
 
+    def test_excluded_underscore_metadata_is_valid_without_authorizing_file_reads(self):
+        value = json.loads(self.manifest_raw)
+        value["auxiliary_excluded"] = [{
+            "path": "reviews/peer-code-synthetic/vendor/synthetic/__init__.py",
+            "reason": "historical_peer_source_attachment_retained_locally"}, {
+            "path": "reviews/peer-code-synthetic/vendor/synthetic/_helper.py",
+            "reason": "historical_peer_source_attachment_retained_locally"}]
+        raw = json.dumps(value).encode()
+        parsed = acceptance._manifest(raw, hashlib.sha256(raw).hexdigest())
+        self.assertEqual(parsed["auxiliary_excluded"], value["auxiliary_excluded"])
+        for item in parsed["auxiliary_excluded"]:
+            self.assertFalse(acceptance.cloud_auxiliary.allowed_path(item["path"]))
+        for forbidden in ("reviews/peer-code-synthetic/../escape.py", "reviews/_helper.py"):
+            value["auxiliary_excluded"][0]["path"] = forbidden
+            raw = json.dumps(value).encode()
+            with self.assertRaises(acceptance.AcceptanceError):
+                acceptance._manifest(raw, hashlib.sha256(raw).hexdigest())
+
     def test_unexpected_post_snapshot_trading_record_is_rejected(self):
         copy = self.output / "copy"
         shutil.copytree(self.working, copy)

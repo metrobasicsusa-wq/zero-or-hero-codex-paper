@@ -205,7 +205,7 @@ def prepare_private_baseline(snapshot, destination, expected_manifest_sha256):
             raise BootstrapError("preparation_changed_trading_evidence")
         bare = destination / "baseline.git"
         _new_directory(bare)
-        core = GitCheckpointStore(bare, branch=BRANCH)
+        core = GitCheckpointStore(bare, branch=BRANCH, timeout_seconds=180)
         try:
             core._checked(bare, "init", "--bare", "--quiet")
             with GitBundleStore(core) as bundle:
@@ -216,7 +216,7 @@ def prepare_private_baseline(snapshot, destination, expected_manifest_sha256):
         _new_directory(restored)
         (restored / "archive").mkdir(mode=0o700)
         restored_archive = restored / "archive/research.sqlite3"
-        fresh_core = GitCheckpointStore(bare, branch=BRANCH)
+        fresh_core = GitCheckpointStore(bare, branch=BRANCH, timeout_seconds=180)
         try:
             with GitBundleStore(fresh_core) as fresh_bundle:
                 loaded = fresh_bundle.restore(restored_archive)

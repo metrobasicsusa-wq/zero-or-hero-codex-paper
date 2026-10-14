@@ -78,7 +78,10 @@ class BootstrapPrivateStateTests(unittest.TestCase):
         (self.snapshot / "archive/research.sqlite3-shm").write_bytes(b"synthetic unused bookkeeping")
         before = {str(p.relative_to(self.snapshot)): hashlib.sha256(p.read_bytes()).hexdigest()
                   for p in self.snapshot.rglob("*") if p.is_file()}
-        result = bootstrap.prepare_private_baseline(self.snapshot, self.destination, self.digest)
+        with patch.object(bootstrap, "GitCheckpointStore", wraps=bootstrap.GitCheckpointStore) as stores:
+            result = bootstrap.prepare_private_baseline(self.snapshot, self.destination, self.digest)
+        self.assertEqual(len(stores.call_args_list), 2)
+        self.assertTrue(all(call.kwargs["timeout_seconds"] == 180 for call in stores.call_args_list))
         self.assertEqual(result["status"], "verified")
         self.assertFalse(result["trading_enabled"])
         self.assertFalse(result["cutover_proof"])

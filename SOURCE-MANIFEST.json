@@ -36,8 +36,13 @@
     },
     {
       "path": "cloud-main/bootstrap_private_state.py",
-      "bytes": 15083,
-      "sha256": "2acebb91da7389c314d2d0569f97107db7bce1b53f8d0f60948fa4611066586a"
+      "bytes": 15125,
+      "sha256": "ac08a2dcfb104aa835f3beead595591a89c32f0ba4ae7facc5fd28dd07d99e6c"
+    },
+    {
+      "path": "cloud-main/prepare_cloud_cutover.py",
+      "bytes": 16423,
+      "sha256": "6a0307404982e274cec35a11808957f1d10586de6780c2a0eb3c28a01160c6ca"
     },
     {
       "path": "cloud-main/prepare_migration_snapshot.py",
@@ -46,8 +51,8 @@
     },
     {
       "path": "cloud-main/verify_private_baseline.py",
-      "bytes": 18770,
-      "sha256": "9e0312ad42374b519c56171d437a504f2eff190166d73e7a424e613ac119264b"
+      "bytes": 18511,
+      "sha256": "93c1fedd361471ec23e2e937f8f17479e84533133a0b0ae721d85e8c3fdca937"
     },
     {
       "path": "run_cloud_preflight.py",
@@ -86,8 +91,8 @@
     },
     {
       "path": "tests/test_bootstrap_private_state.py",
-      "bytes": 10444,
-      "sha256": "f39d21a923168d79f8bf79a1c2e52d91c30dd5abcdd5f09e29dfd3141337d405"
+      "bytes": 10712,
+      "sha256": "688db90569c70683dfef173d9d00dfd3c2677bfe650431eeb528d40e6ad93ffd"
     },
     {
       "path": "tests/test_broker.py",
@@ -118,6 +123,11 @@
       "path": "tests/test_cloud_checkpoint_files.py",
       "bytes": 6314,
       "sha256": "f6d1614baddd20634032d444dd605d628532c6338951e9eecc8fdf3db84ad9d8"
+    },
+    {
+      "path": "tests/test_cloud_cutover_preparation.py",
+      "bytes": 11538,
+      "sha256": "7f63061fb83f6f5ed7783cb898e176d489df0565ef8172a5799372da1afa7145"
     },
     {
       "path": "tests/test_cloud_engine.py",
@@ -171,8 +181,8 @@
     },
     {
       "path": "tests/test_private_baseline_acceptance.py",
-      "bytes": 12047,
-      "sha256": "6bcf3e79f884c33cc451a8ce2864fdd3dd6b42d1c7a0b89d0aa5d1f55c5c40da"
+      "bytes": 13214,
+      "sha256": "34289d4ddefa62bc0e0541141358e54586f4cff0d9bde8348f0c980de08f3b9a"
     },
     {
       "path": "tests/test_research_schedule.py",
