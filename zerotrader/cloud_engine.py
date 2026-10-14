@@ -288,7 +288,7 @@ class CloudEngine(Engine):
             quantity = _nonnegative(positions.get(symbol, {}).get("qty", 0))
             for order in orders:
                 _order_numbers(order)
-            potential = sum(_order_numbers(order)[0] - _order_numbers(order)[1] for order in orders if order["side"] == "buy")
+            potential = sum((_order_numbers(order)[0] - _order_numbers(order)[1] for order in orders if order["side"] == "buy"), 0.0)
             if not quantity.is_integer() or not math.isfinite(potential) or not potential.is_integer():
                 raise ValueError
         except (ValueError, TypeError, KeyError):

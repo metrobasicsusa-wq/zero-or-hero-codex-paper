@@ -176,8 +176,8 @@
     },
     {
       "path": "zerotrader/cloud_engine.py",
-      "bytes": 21185,
-      "sha256": "90b35fd63f0dfde209d48c70389a10b058a7cafc702023de51843c7fd27ccf58"
+      "bytes": 21192,
+      "sha256": "e6738add9f27d7636c019be6d90e904cefa682b5eee70133301db84af15493ae"
     },
     {
       "path": "zerotrader/cloud_github.py",
