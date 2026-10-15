@@ -62,7 +62,8 @@ def _result():
         "risk_latched": False, "paused": False, "positions": 0, "open_orders": 0,
         "queried_intents": 0, "unresolved_intents": 0, "unknown_positions": 0, "unknown_orders": 0,
         "quantity_mismatches": 0, "unprotected_positions": 0, "fill_activity_versions": 0,
-        "unknown_fill_orders": 0, "overnight_intraday_positions": 0, "reconciliation_passed": False}
+        "unknown_fill_orders": 0, "overnight_intraday_positions": 0, "reconciliation_passed": False,
+        "risk_check_failures": [], "valuation_above_entry_budget": False}
 
 
 def _allowed_request(request):
@@ -239,6 +240,7 @@ def compare_observations(state, broker, config, cursor, expected_account, result
         expected_qty[symbol] = expected_qty.get(symbol, Decimal(0)) + _number(fill["qty"]) * (1 if fill["side"] == "buy" else -1)
     actual_qty, gross = {}, Decimal(0)
     exposures = {sleeve: Decimal(0) for sleeve in ("swing", "intraday")}
+    acquisition = {sleeve: Decimal(0) for sleeve in exposures}
     for position in positions:
         symbol, qty = position["symbol"], _number(position["qty"], positive=True)
         if position.get("asset_class", "us_equity") != "us_equity":
@@ -248,9 +250,11 @@ def compare_observations(state, broker, config, cursor, expected_account, result
         if not owner:
             result["unknown_positions"] += 1
             continue
-        value = max(_number(position["market_value"]), _number(position["cost_basis"]))
+        cost = _number(position["cost_basis"])
+        value = max(_number(position["market_value"]), cost)
         gross += value
         exposures[owner["sleeve"]] += value
+        acquisition[owner["sleeve"]] += cost
         if owner["sleeve"] == "intraday" and owner.get("entry_day") != observed.astimezone(NY).date().isoformat():
             result["overnight_intraday_positions"] += 1
         coverage = sum((_number(o["qty"]) - _number(o.get("filled_qty") or 0) for oid, o in open_orders.items()
@@ -308,14 +312,28 @@ def compare_observations(state, broker, config, cursor, expected_account, result
         reservations[state["owners"][order["symbol"]]["sleeve"]] += reserved
     total_reserved = sum(reservations.values(), Decimal(0))
     peak = max(_number(state["equity_peak"], positive=True), equity)
-    if (state["paused"] or state["halted"] or account.get("status") != "ACTIVE"
-            or account.get("trading_blocked") or account.get("account_blocked")
-            or (peak - equity) / peak >= Decimal(str(config["max_drawdown"])) - _EPSILON
-            or gross + total_reserved > _number(config["capital"])
-            or any(exposures[s] + reservations[s] > _number(config[s]["allocation"]) for s in exposures)
-            or total_reserved > cash
-            or (total_reserved > 0 and cash - total_reserved < _number(config["capital"]) * _number(config["cash_reserve_fraction"]))
-            or result["overnight_intraday_positions"]):
+    # Engine.cycle applies max(market value, cost basis) to NEW entries; an
+    # already-owned position appreciating above its entry budget does not halt
+    # protective management or authorize additional investment. Match that
+    # existing behavior during transfer, without changing the engine or caps.
+    # Acquisition basis and every pending buy remain bounded independently.
+    capital = _number(config["capital"])
+    result["valuation_above_entry_budget"] = bool(gross > capital or any(
+        exposures[s] > _number(config[s]["allocation"]) for s in exposures))
+    checks = {
+        "paused_or_halted": bool(state["paused"] or state["halted"]),
+        "broker_account_blocked": bool(account.get("status") != "ACTIVE" or account.get("trading_blocked") or account.get("account_blocked")),
+        "drawdown_limit": (peak - equity) / peak >= Decimal(str(config["max_drawdown"])) - _EPSILON,
+        "acquisition_capital_limit": sum(acquisition.values(), Decimal(0)) + total_reserved > capital,
+        "acquisition_sleeve_limit": any(acquisition[s] + reservations[s] > _number(config[s]["allocation"]) for s in exposures),
+        "pending_buy_capital_limit": total_reserved > 0 and gross + total_reserved > capital,
+        "pending_buy_sleeve_limit": any(reservations[s] > 0 and exposures[s] + reservations[s] > _number(config[s]["allocation"]) for s in exposures),
+        "pending_buy_cash_limit": total_reserved > cash,
+        "cash_reserve_limit": total_reserved > 0 and cash - total_reserved < capital * _number(config["cash_reserve_fraction"]),
+        "overnight_intraday": bool(result["overnight_intraday_positions"]),
+    }
+    result["risk_check_failures"] = sorted(name for name, failed in checks.items() if failed)
+    if result["risk_check_failures"]:
         raise ReconciliationFailure("risk_or_account_blocks_enable")
 
 

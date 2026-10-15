@@ -161,8 +161,8 @@
     },
     {
       "path": "tests/test_cloud_reconcile.py",
-      "bytes": 18082,
-      "sha256": "874dd44bcec25ca6667791b55c211d07b61925b78cb5f048bc58791412ec1bae"
+      "bytes": 19525,
+      "sha256": "355e439382fa5bb4b930b606ea26bd8ab9c8a86c0649b8476ffd44878a9e83d8"
     },
     {
       "path": "tests/test_cloud_runner.py",
@@ -291,8 +291,8 @@
     },
     {
       "path": "zerotrader/cloud_reconcile.py",
-      "bytes": 22652,
-      "sha256": "ac16d20c6cea4c27fb84e5a968e94cd56790b78f60bf6281c3a2c14ed20a1212"
+      "bytes": 23988,
+      "sha256": "52a674e34c88ebfa4fdbb2c135fc930f808fe4d791043a78c7c557426c5c106f"
     },
     {
       "path": "zerotrader/cloud_runner.py",

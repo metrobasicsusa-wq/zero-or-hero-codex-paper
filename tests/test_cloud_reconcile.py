@@ -223,6 +223,31 @@ class ReconciliationTests(unittest.TestCase):
         self.broker.activities = []
         self.failure("broker_response_invalid")
 
+    def test_owned_appreciation_does_not_disable_protective_management_transfer(self):
+        self.broker.position_values[0]["market_value"] = "50001"
+        self.compare()
+        self.assertTrue(self.result["valuation_above_entry_budget"])
+        self.assertEqual(self.result["risk_check_failures"], [])
+
+    def test_excess_acquisition_basis_is_not_treated_as_appreciation(self):
+        self.broker.position_values[0].update(market_value="49000", cost_basis="50001")
+        self.failure("risk_or_account_blocks_enable")
+        self.assertIn("acquisition_sleeve_limit", self.result["risk_check_failures"])
+
+    def test_pending_buy_cannot_add_to_appreciated_full_sleeve(self):
+        self.broker.position_values[0]["market_value"] = "50001"
+        self.broker.parent.update(status="partially_filled", qty="11")
+        self.state["intents"][CID]["payload"]["qty"] = "11"
+        self.state["intents"][CID]["status"] = "partially_filled"
+        self.broker.open_values = [self.broker.parent, self.broker.stop]
+        self.failure("risk_or_account_blocks_enable")
+        self.assertIn("pending_buy_sleeve_limit", self.result["risk_check_failures"])
+
+    def test_account_restriction_is_named_and_cannot_be_cleared_by_transfer(self):
+        self.broker.account_value["trading_blocked"] = True
+        self.failure("risk_or_account_blocks_enable")
+        self.assertIn("broker_account_blocked", self.result["risk_check_failures"])
+
     def test_transport_rejects_mutations_and_other_hosts_before_network(self):
         broker = reconcile.ReadOnlyPaperBroker(credential_loader=lambda: {"key": "synthetic-key", "secret": "synthetic-secret"}, transport=self.broker.transport)
         for method in ("POST", "PATCH", "DELETE"):
