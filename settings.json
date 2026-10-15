@@ -8,7 +8,15 @@
   "max_spread_fraction": 0.005,
   "entry_timeout_minutes": 15,
   "swing": {"allocation": 50000, "max_positions": 5, "stop_pct": 0.05},
-  "intraday": {"allocation": 50000, "max_positions": 3, "stop_pct": 0.015},
+  "intraday": {"allocation": 49000, "max_positions": 3, "stop_pct": 0.015},
+  "options": {
+    "enabled": true, "allocation": 1000, "lifetime_premium_cap": 960,
+    "fee_contingency": 40, "max_lifetime_contracts": 4,
+    "max_premium_per_contract": 240, "fee_allowance_per_contract": 10,
+    "max_positions": 2, "quote_feed": "indicative",
+    "max_quote_age_seconds": 90, "max_spread_fraction": 0.10,
+    "min_dte": 7, "max_dte": 21, "max_moneyness_fraction": 0.01
+  },
   "swing_universe": ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","AMD","ORCL","CRM","ADBE","NFLX","COST","WMT","HD","LOW","MCD","SBUX","NKE","JPM","BAC","GS","MS","V","MA","UNH","JNJ","ABBV","MRK","LLY","PFE","XOM","CVX","COP","CAT","DE","GE","HON","RTX","UPS","FDX","TMO","AMAT","QCOM","TXN","MU","IBM","INTU","NOW"],
   "intraday_universe": ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AMD","AVGO","JPM"]
 }

@@ -1,7 +1,7 @@
 {
   "format_version": 1,
-  "purpose": "offline_tests_and_readonly_connection_preflight",
-  "source_date": "2026-10-14",
+  "purpose": "code_only_paper_validation_and_bounded_options_pilot",
+  "source_date": "2026-10-15",
   "transformations": [
     {
       "path": "scripts/build_dashboard.py",
@@ -41,8 +41,8 @@
     },
     {
       "path": "README.md",
-      "bytes": 2926,
-      "sha256": "ce4a0c9d1de1a56952fcda4656ba92edd7fa743d8f565eb83d596d586db250be"
+      "bytes": 5034,
+      "sha256": "632803c2d7d7638d595c19c89b45c7f6806aafc7e9bc2188458dbe7076cdad5f"
     },
     {
       "path": "cloud-main/bootstrap_private_state.py",
@@ -91,8 +91,8 @@
     },
     {
       "path": "settings.json",
-      "bytes": 788,
-      "sha256": "459894a5e6a50a34e2b139f9063889623fd060ca445f4d140f48e62b6ad655ad"
+      "bytes": 1183,
+      "sha256": "b0f186edf9e59cbad4e974c83bab0d12c3bba8f01ffe082ef737d2d4114df154"
     },
     {
       "path": "tests/test_archival.py",
@@ -166,8 +166,8 @@
     },
     {
       "path": "tests/test_cloud_runner.py",
-      "bytes": 25089,
-      "sha256": "c1d843eb56bf09b66475708cac7ef59bcf8a94583a43109cad963c14263be044"
+      "bytes": 30199,
+      "sha256": "06ed5ddd0b87091905badb30588e13e8abc34f70323d4cc65210fe6ff3489b23"
     },
     {
       "path": "tests/test_cloud_runtime.py",
@@ -200,14 +200,39 @@
       "sha256": "9f4dadb429ede1161f2f9cf71b04b2c0798c3dd0bdf429414461f673c9e297c5"
     },
     {
+      "path": "tests/test_options_broker.py",
+      "bytes": 17587,
+      "sha256": "1cecbed4afdeb44798ea9eb925f08d53d7847ca484c8873318cc3c9c483fc2b0"
+    },
+    {
+      "path": "tests/test_options_cloud_reconcile.py",
+      "bytes": 15787,
+      "sha256": "edef8b2f378e9fec2f31a373d1b4f49e63d44d30049935c42b3d83fbb0c688d3"
+    },
+    {
+      "path": "tests/test_options_execution.py",
+      "bytes": 27775,
+      "sha256": "a0b371528885cfc586f673674853b2b0da118e378c51b4bf089c52d85cecb903"
+    },
+    {
+      "path": "tests/test_options_lifecycle.py",
+      "bytes": 12073,
+      "sha256": "05f68e5e79522e68241bb605a8e7c3654f9b59075ec626f4f9514cac14fdc333"
+    },
+    {
+      "path": "tests/test_options_pilot.py",
+      "bytes": 12054,
+      "sha256": "0eb0e087aa01330c48f681ea795909cbdea4bbb0761715afd7d5aa8a1d88bff7"
+    },
+    {
       "path": "tests/test_private_baseline_acceptance.py",
       "bytes": 13214,
       "sha256": "34289d4ddefa62bc0e0541141358e54586f4cff0d9bde8348f0c980de08f3b9a"
     },
     {
       "path": "tests/test_research_schedule.py",
-      "bytes": 3059,
-      "sha256": "f048d1267c1bad2abae506f2f7d8a6923a3ac0128786c24155dd39083a137a96"
+      "bytes": 7988,
+      "sha256": "d911dd82a7ab4ca5c05ca537aff412e9b1232fff91e8fb63d936f64b2a0c79f1"
     },
     {
       "path": "tests/test_runner.py",
@@ -241,8 +266,8 @@
     },
     {
       "path": "zerotrader/archival.py",
-      "bytes": 4693,
-      "sha256": "e670536584fe86adb148451b78927fb05d795bc90916ff2ef2d0726210178b36"
+      "bytes": 10292,
+      "sha256": "4e139e2cc7f9d16b65700f1fc7706484387c7ad78f40ed0a0cdc91ba824bcc79"
     },
     {
       "path": "zerotrader/archive.py",
@@ -251,8 +276,8 @@
     },
     {
       "path": "zerotrader/broker.py",
-      "bytes": 20244,
-      "sha256": "97de1a8a2bd9f82cb3d28ec0c980ba7f64a4b3279c07237817dfe67e43b7f84b"
+      "bytes": 34016,
+      "sha256": "d4808f771f452ba6d8a73d4aa947e47dcec76103862b48c5c8dcb5cf67c7a614"
     },
     {
       "path": "zerotrader/cloud_archive.py",
@@ -276,8 +301,8 @@
     },
     {
       "path": "zerotrader/cloud_engine.py",
-      "bytes": 21192,
-      "sha256": "e6738add9f27d7636c019be6d90e904cefa682b5eee70133301db84af15493ae"
+      "bytes": 22458,
+      "sha256": "4c87b7904f42a883ddf0667e0ad5fcf2342fc7d0e69e76c056fd192e41f78008"
     },
     {
       "path": "zerotrader/cloud_github.py",
@@ -291,13 +316,13 @@
     },
     {
       "path": "zerotrader/cloud_reconcile.py",
-      "bytes": 23988,
-      "sha256": "52a674e34c88ebfa4fdbb2c135fc930f808fe4d791043a78c7c557426c5c106f"
+      "bytes": 30246,
+      "sha256": "784de7a742f9c3eae5a4114cc9ab37a164e513776870842daad4ebff38efcc11"
     },
     {
       "path": "zerotrader/cloud_runner.py",
-      "bytes": 27391,
-      "sha256": "89f36207e37ec432522eb44233e37016324bb222dca0762e530bcdd5cb8d99a7"
+      "bytes": 27938,
+      "sha256": "7dc1f2a958b365d01f481376a2487266be7c43321fa3ecaf762d49b88f67c153"
     },
     {
       "path": "zerotrader/data.py",
@@ -306,8 +331,8 @@
     },
     {
       "path": "zerotrader/engine.py",
-      "bytes": 22716,
-      "sha256": "78b438864f0747b875c273721270f1f53c166af45e74b6cc6203e57725046be8"
+      "bytes": 26623,
+      "sha256": "0c6f051d65f6d4a47da3f448e1a83408db61b064d42f5f700b032dacc4c30478"
     },
     {
       "path": "zerotrader/intraday.py",
@@ -315,19 +340,29 @@
       "sha256": "7f0492f70bace1d3dd8618edd61a780b48f1f259516f7bdb08f3d3e390085bdf"
     },
     {
+      "path": "zerotrader/options_execution.py",
+      "bytes": 22453,
+      "sha256": "6937cef480f5c385102b68ef5b56fa6b794c5b9943a34371cf5143767ccac5de"
+    },
+    {
+      "path": "zerotrader/options_pilot.py",
+      "bytes": 24026,
+      "sha256": "473c5937844a560b71f2abdcb6350a12073be21e7eb616dcbf717281f9a678c5"
+    },
+    {
       "path": "zerotrader/report.py",
-      "bytes": 5580,
-      "sha256": "9a95869dd1739020ae6e1ca6a4044ad65016737e17f1ffe766d990d57571087d"
+      "bytes": 7401,
+      "sha256": "21a3c64f1987f97a5ff2461debd8c83bf14eab6b9612d473ed6e65ce35f26d57"
     },
     {
       "path": "zerotrader/risk.py",
-      "bytes": 2771,
-      "sha256": "18d710d8c9b79a726bade35aec44f41d724febb644b616d823089ff68119fa66"
+      "bytes": 2878,
+      "sha256": "fc673fdb13ab9e89c1186a8a4003a9a63edb96806f08a4eecf91efbafc54ec92"
     },
     {
       "path": "zerotrader/runner.py",
-      "bytes": 13921,
-      "sha256": "6ab293a8519b8d5449f78fb03b80108857c172e9defbce5d664b561a1dd51614"
+      "bytes": 15776,
+      "sha256": "6f6b3acf5b336ab2b9e14f134308a0fc941fa35059cbb5c01e79e0ac19ef8cb2"
     },
     {
       "path": "zerotrader/samples.py",

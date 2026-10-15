@@ -23,6 +23,9 @@ def validate_config(config):
         raise ValueError('Quote freshness must be within 120 seconds.')
     if not 0 < config['max_spread_fraction'] <= .005:
         raise ValueError('Spread threshold may not exceed 0.5%.')
+    if 'options' in config:
+        from .options_pilot import policy_config
+        policy_config(config)
 
 
 def drawdown(equity, high_water):

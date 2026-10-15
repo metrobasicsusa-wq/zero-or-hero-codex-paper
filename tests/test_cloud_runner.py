@@ -15,10 +15,11 @@ from contextlib import closing, nullcontext, redirect_stdout, redirect_stderr
 import test_engine
 from zerotrader import runner
 from zerotrader.archive import ResearchArchive
+from zerotrader.archival import capture_fills
 from zerotrader.cloud_auxiliary import capture_auxiliary
 from zerotrader.cloud_bundle import BundleCorrupt, BundleReceipt, BundleUncertain, RecoveredBundle
 from zerotrader.cloud_checkpoint import CheckpointConflict, CheckpointReceipt, CheckpointUncertain, LoadedCheckpoint, _canonical, _transition
-from zerotrader.cloud_engine import CloudDurabilityError
+from zerotrader.cloud_engine import CloudDurabilityError, CloudEngine
 from zerotrader.cloud_runner import (
     CODE_REPOSITORY, STATE_REPOSITORY, CloudCoordinator, CloudRunError,
     account_digest, environment_paper_credentials, main, run_duration, validate_cutover, validate_environment, within_session_window,
@@ -268,6 +269,84 @@ class CloudRunnerTests(unittest.TestCase):
         self.assertEqual(self.broker.submitted, [])
         self.assertEqual(result["status"], "completed_with_alerts")
         self.assertTrue(self.bundle.calls)
+
+    def test_closed_lifecycle_collection_pause_matches_snapshot_archive_and_remote_core(self):
+        # The first risk snapshot precedes collection. There is deliberately no
+        # second engine cycle in this closed session to refresh its pause/alerts.
+        self.broker.fill_activities = lambda **kwargs: []
+        self.broker.options_lifecycle_activities = lambda **kwargs: [{
+            "id": "synthetic-expiry-closed", "activity_type": "OPEXP",
+            "date": "2026-10-14", "symbol": "AAPL261014C00100000", "qty": "-1"}]
+        self.ops.capture_fills = capture_fills
+        with patch("zerotrader.cloud_runner.CloudEngine.cycle", autospec=True,
+                   side_effect=CloudEngine.cycle) as cycle, \
+                patch.object(self.ops, "refresh", side_effect=AssertionError("closed session must not select")) as refresh:
+            result = self.cycle()
+        self.assertEqual(cycle.call_count, 1)
+        refresh.assert_not_called()
+        self.assertEqual(result["status"], "completed_with_alerts")
+        self.assertTrue(result["paused"])
+        self.assertEqual(self.broker.submitted, [])
+        latest = json.loads((self.directory / "latest.json").read_text())
+        with self.archive._connect() as db:
+            run = db.execute("SELECT status,snapshot_hash FROM runs WHERE action='cloud_cycle'").fetchone()
+            lifecycle_count = db.execute("SELECT count(*) FROM events WHERE kind='broker_option_lifecycle_activity'").fetchone()[0]
+            fills_count = db.execute("SELECT count(*) FROM events WHERE kind='broker_fill_activity'").fetchone()[0]
+        archived = self.archive.get_blob(run["snapshot_hash"])
+        self.assertEqual(run["status"], "completed_with_alerts")
+        self.assertEqual((lifecycle_count, fills_count), (1, 0))
+        self.assertEqual(archived, latest)
+        self.assertTrue(latest["paused"])
+        self.assertTrue(any("lifecycle" in alert and "manual" in alert for alert in latest["alerts"]))
+        self.assertTrue(any(event.get("event") == "options_lifecycle_manual_review" for event in latest["events"]))
+        self.assertEqual(latest["paused"], self.core.state["paused"])
+        self.assertEqual(latest["halted"], self.core.state["halted"])
+        self.assertEqual(latest["events"], self.core.state["events"][-30:])
+        self.assertTrue(any(review["manual_review_required"]
+                            for review in self.core.state["strategies"]["options"]["lifecycle_reviews"].values()))
+        self.assertEqual(self.bundle.calls[-1][1], self.core.state)
+
+    def test_collection_mutation_checkpoint_failure_poison_stops_before_signal_cycle(self):
+        self.broker.open = True
+        self.broker.now = datetime(2026, 10, 14, 11, 0, tzinfo=NY)
+        self.broker.fill_activities = lambda **kwargs: []
+        self.broker.options_lifecycle_activities = lambda **kwargs: [{
+            "id": "synthetic-expiry-uncertain-save", "activity_type": "OPEXP",
+            "date": "2026-10-14", "symbol": "AAPL261014C00100000", "qty": "-1"}]
+        self.ops.capture_fills = capture_fills
+        failed_attempts = []
+
+        def reject_mutated_pause(candidate):
+            if candidate["paused"] and candidate["strategies"].get("options", {}).get("lifecycle_reviews"):
+                failed_attempts.append(deepcopy(candidate))
+                raise CheckpointUncertain(self.core.receipt)
+
+        self.core.before = reject_mutated_pause
+        with patch("zerotrader.cloud_runner.CloudEngine.cycle", autospec=True,
+                   side_effect=CloudEngine.cycle) as cycle, \
+                patch.object(self.ops, "refresh", side_effect=AssertionError("must stop before refresh")) as refresh, \
+                patch.object(self.ops, "make_signals", side_effect=AssertionError("must not select entries")) as signals:
+            with self.assertRaises(CloudRunError):
+                self.cycle()
+        self.assertEqual(len(failed_attempts), 1)
+        self.assertEqual(cycle.call_count, 1)
+        refresh.assert_not_called()
+        signals.assert_not_called()
+        self.assertTrue(self.coordinator.failed)
+        self.assertTrue(self.state["paused"])
+        self.assertFalse(self.core.state["paused"])
+        self.assertNotIn("lifecycle_reviews", self.core.state["strategies"]["options"])
+        self.assertEqual(self.broker.submitted, [])
+        self.assertEqual(self.bundle.calls, [])
+        self.assertFalse((self.directory / "latest.json").exists())
+        with self.archive._connect() as db:
+            self.assertEqual(db.execute("SELECT status FROM runs WHERE action='cloud_cycle'").fetchone()[0], "failed")
+            self.assertEqual(db.execute("SELECT count(*) FROM events WHERE kind='cloud_collection_failed'").fetchone()[0], 0)
+        # The persistence error must not be downgraded to collection degradation,
+        # and the poisoned coordinator cannot attempt a later broker cycle.
+        with self.assertRaises(CloudDurabilityError):
+            self.cycle()
+        self.assertEqual(len(failed_attempts), 1)
 
     def test_real_cloud_engine_buy_uses_shared_core_bundle_chain(self):
         self.broker.open = True

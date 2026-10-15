@@ -2,10 +2,12 @@
 from datetime import datetime, timedelta
 import hashlib
 import math
+from decimal import InvalidOperation
 from .broker import BrokerError, OrderAmbiguous, OrderRejected
 from .data import NY, timestamp
 from .risk import drawdown, entry_size, validated_quote, validate_config
 from .storage import write_json
+from . import options_execution
 
 TERMINAL = {'filled', 'canceled', 'expired', 'rejected', 'replaced', 'not_submitted'}
 
@@ -62,6 +64,13 @@ class Engine:
                 if intent['status'] in ('submitting', 'uncertain'):
                     self.alerts.append('Unresolved submission ' + cid + '; new entries blocked. No automatic resubmission.')
                 continue
+            if intent['sleeve'] == 'options':
+                try:
+                    options_execution.validate_order(intent, order)
+                except (ValueError, KeyError, TypeError, InvalidOperation):
+                    self.audit_event('option_order_identity_mismatch', {'client_order_id': cid, 'broker_order': order})
+                    options_execution.inventory_problem(self)
+                    continue
             intent.update(order_id=order['id'], status=order['status'])
             digest = hashlib.sha256(repr(sorted(order.items())).encode()).hexdigest()
             if intent.get('last_order_observation') != digest:
@@ -77,12 +86,13 @@ class Engine:
                 quantity = float(leg.get('filled_qty') or 0)
                 price = float(leg.get('filled_avg_price') or 0)
                 if quantity > 0 and price > 0:
+                    multiplier = 100 if intent['sleeve'] == 'options' else 1
                     previous_fill = self.state['fills'].get(leg['id'], {})
                     old_quantity = previous_fill.get('qty', 0)
                     old_price = previous_fill.get('price', 0)
-                    self.state['fills'][leg['id']] = {'symbol': leg['symbol'], 'side': leg['side'], 'qty': quantity, 'price': price, 'sleeve': intent['sleeve'], 'filled_at': leg.get('filled_at')}
+                    self.state['fills'][leg['id']] = {'symbol': leg['symbol'], 'side': leg['side'], 'qty': quantity, 'price': price, 'sleeve': intent['sleeve'], 'filled_at': leg.get('filled_at'), 'multiplier': multiplier}
                     if quantity != old_quantity or price != old_price:
-                        self.record({'at': leg.get('filled_at'), 'event': 'fill_observed', 'source': 'cumulative_order_poll', 'symbol': leg['symbol'], 'sleeve': intent['sleeve'], 'side': leg['side'], 'filled_qty': quantity, 'filled_avg_price': price, 'delta_qty': quantity - old_quantity, 'delta_notional': quantity * price - old_quantity * old_price, 'order_id': leg['id']})
+                        self.record({'at': leg.get('filled_at'), 'event': 'fill_observed', 'source': 'cumulative_order_poll', 'symbol': leg['symbol'], 'sleeve': intent['sleeve'], 'side': leg['side'], 'filled_qty': quantity, 'filled_avg_price': price, 'delta_qty': quantity - old_quantity, 'delta_notional': (quantity * price - old_quantity * old_price) * multiplier, 'multiplier': multiplier, 'order_id': leg['id']})
         self.save()
 
     def submit(self, payload, sleeve, now):
@@ -95,8 +105,15 @@ class Engine:
         self.state['intents'][cid] = {'payload': payload, 'sleeve': sleeve, 'status': 'submitting', 'created': now.isoformat()}
         if payload['side'] == 'sell':
             self.state['intents'][cid]['exit_for'] = getattr(self, '_exit_for', None)
+            if sleeve == 'options':
+                self.state['intents'][cid].update(options_execution.owner_metadata(
+                    self.state['owners'][payload['symbol']]))
         if payload['side'] == 'buy':
             self.state['owners'][payload['symbol']] = {'sleeve': sleeve, 'entry_cid': cid, 'entry_day': now.date().isoformat()}
+            if sleeve == 'options':
+                metadata = options_execution.owner_metadata(self._entry_context)
+                self.state['owners'][payload['symbol']].update(metadata)
+                self.state['intents'][cid].update(metadata)
         self.save()
         audited = self.audit_event('order_intent', {'client_order_id': cid, 'sleeve': sleeve, 'payload': payload, 'strategy': self.state['strategies'].get(sleeve), 'context': getattr(self, '_entry_context', None) if payload['side'] == 'buy' else {'exit_for': getattr(self, '_exit_for', None)}})
         if not audited and payload['side'] == 'buy':
@@ -104,8 +121,23 @@ class Engine:
             self.save()
             return False
         try:
-            order = self.broker.submit_order(payload)
+            if sleeve == 'options' and payload['side'] == 'buy':
+                try:
+                    options_execution.fresh_guard(self, payload, self._entry_context)
+                except (ValueError, KeyError, TypeError):
+                    self.state['intents'][cid].update(status='not_submitted', reason='options_pre_submit_check_failed')
+                    self.save()
+                    return False
+            order = (self.broker.submit_option_order(payload) if sleeve == 'options'
+                     else self.broker.submit_order(payload))
             self.audit_event('order_response', {'client_order_id': cid, 'sleeve': sleeve, 'broker_order': order})
+            if sleeve == 'options':
+                try:
+                    options_execution.validate_order(self.state['intents'][cid], order)
+                except (ValueError, KeyError, TypeError, InvalidOperation):
+                    self.state['intents'][cid]['status'] = 'uncertain'
+                    options_execution.inventory_problem(self)
+                    return False
             self.state['intents'][cid].update(order_id=order['id'], status=order['status'])
             self.state.setdefault('known_order_ids', []).extend(o['id'] for o in flatten([order]) if o['id'] not in self.state.get('known_order_ids', []))
             self.record({'at': now.isoformat(), 'event': 'order_submitted', 'sleeve': sleeve, 'symbol': payload['symbol'], 'side': payload['side'], 'qty': payload['qty'], 'order_id': order['id']})
@@ -173,10 +205,14 @@ class Engine:
 
     def snapshot(self, account, positions, clock, signals=None):
         sleeves = {}
-        for sleeve in ('swing', 'intraday'):
-            cashflow = sum(v['qty'] * v['price'] * (1 if v['side'] == 'sell' else -1) for v in self.state['fills'].values() if v['sleeve'] == sleeve)
+        for sleeve in ('swing', 'intraday') + (('options',) if 'options' in self.state['strategies'] else ()):
+            cashflow = sum(v['qty'] * v['price'] * (100 if sleeve == 'options' else 1) * (1 if v['side'] == 'sell' else -1) for v in self.state['fills'].values() if v['sleeve'] == sleeve)
             value = sum(float(p['market_value']) for p in positions if self.state['owners'].get(p['symbol'], {}).get('sleeve') == sleeve)
-            sleeves[sleeve] = {'budget': self.config[sleeve]['allocation'], 'tracked_equity': self.config[sleeve]['allocation'] + cashflow + value, 'market_value': value, 'params': self.state['strategies'].get(sleeve, {}).get('params'), 'stage': self.state['strategies'].get(sleeve, {}).get('stage', 'baseline_paper_experiment')}
+            allocation = (options_execution.policy_config(self.config) if sleeve == 'options' else self.config[sleeve])['allocation']
+            sleeves[sleeve] = {'budget': allocation, 'tracked_equity': allocation + cashflow + value, 'market_value': value, 'params': self.state['strategies'].get(sleeve, {}).get('params'), 'stage': self.state['strategies'].get(sleeve, {}).get('stage', 'baseline_paper_experiment')}
+            if sleeve == 'options':
+                sleeves[sleeve].update(feed='indicative', fees_included=False, limitations=options_execution.LIMITATIONS,
+                    risk_ledger=self.state['strategies']['options'].get('risk_ledger', {}))
         return {'at': clock['timestamp'], 'mode': 'PAPER', 'enabled': self.config['enabled'], 'paused': self.state['paused'], 'halted': self.state['halted'], 'account_status': account['status'], 'equity': float(account['equity']), 'cash': float(account['cash']), 'high_water': self.state['equity_peak'], 'drawdown': drawdown(account['equity'], self.state['equity_peak']), 'drawdown_limit': self.config['max_drawdown'], 'market_open': clock['is_open'], 'next_open': clock['next_open'], 'positions': positions, 'sleeves': sleeves, 'signals': signals or {}, 'actions': self.actions, 'alerts': self.alerts, 'last_research': self.state['last_research'], 'events': self.state['events'][-30:]}
 
     def cycle(self, signals, execute=True):
@@ -185,14 +221,29 @@ class Engine:
         if self.state['account_id'] and self.state['account_id'] != account['id']:
             raise RuntimeError('Account differs from the bound paper account; execution blocked.')
         self.state['account_id'] = account['id']
+        if execute and self.config['enabled']:
+            options_execution.initialize(self)
+        # Preserve prior cumulative cost/quantity before broker corrections replace it.
+        if execute:
+            options_execution.safe_synchronize_ledger(self, self.broker.positions())
         self.reconcile()
         positions, orders = self.broker.positions(), list(flatten(self.broker.orders()))
-        self.audit_event('broker_snapshot', {'account': {key: account.get(key) for key in ('status', 'currency', 'cash', 'equity', 'buying_power', 'trading_blocked', 'account_blocked')}, 'clock': clock, 'positions': positions, 'orders': orders, 'phase': 'selection' if signals else 'risk_check'})
+        if execute:
+            options_execution.safe_synchronize_ledger(self, positions)
+        self.audit_event('broker_snapshot', {'account': {key: account.get(key) for key in ('status', 'currency', 'cash', 'equity', 'buying_power', 'trading_blocked', 'account_blocked', 'options_approved_level', 'options_trading_level', 'options_buying_power')}, 'clock': clock, 'positions': positions, 'orders': orders, 'phase': 'selection' if signals else 'risk_check'})
         active_symbols = {o['symbol'] for o in orders if o['status'] not in TERMINAL}
         for symbol in list(self.state['owners']):
             owner = self.state['owners'][symbol]
             entry = self.state['intents'][owner['entry_cid']]
             if symbol not in {p['symbol'] for p in positions} and symbol not in active_symbols and entry['status'] in TERMINAL:
+                if owner['sleeve'] == 'options':
+                    try:
+                        releasable = options_execution.can_release_owner(self, owner)
+                    except (ValueError, KeyError, TypeError, InvalidOperation):
+                        releasable = False
+                    if not releasable:
+                        options_execution.inventory_problem(self)
+                        continue
                 del self.state['owners'][symbol]
         unknown = [p['symbol'] for p in positions if p['symbol'] not in self.state['owners']]
         known = set(self.state.get('known_order_ids', [])) | {v.get('order_id') for v in self.state['intents'].values()}
@@ -213,9 +264,16 @@ class Engine:
             self.audit_event('execution_gate', {'at': now.isoformat(), 'execute_requested': execute, 'enabled': self.config['enabled'], 'market_open': clock['is_open']})
             return self.snapshot(account, positions, clock, signals)
         close_time = timestamp(clock['next_close']).astimezone(NY)
+        try:
+            options_execution.protect_and_manage(self, positions, orders, now, close_time)
+        except (ValueError, KeyError, TypeError, InvalidOperation):
+            # Option metadata must fail closed without skipping owned stock exits.
+            options_execution.inventory_problem(self)
         exit_intraday = now >= close_time - timedelta(minutes=20)
         rebalance_swing = (now.hour, now.minute) >= (9, 45)
         for symbol, owner in list(self.state['owners'].items()):
+            if owner['sleeve'] == 'options':
+                continue
             entry = self.state['intents'][owner['entry_cid']]
             stale_entry = entry['status'] not in TERMINAL and now - timestamp(entry['created']) >= timedelta(minutes=self.config['entry_timeout_minutes'])
             stale_overnight = owner['sleeve'] == 'intraday' and owner['entry_day'] != now.date().isoformat()
@@ -236,10 +294,12 @@ class Engine:
             return self.snapshot(account, positions, clock, signals)
         held = {p['symbol'] for p in positions}
         active_symbols = {o['symbol'] for o in orders if o['status'] not in TERMINAL}
-        reservation = sum(max(0., float(o['qty']) - float(o.get('filled_qty') or 0)) * float(o.get('limit_price') or 0) for o in orders if o['side'] == 'buy' and o['status'] not in TERMINAL)
+        reservation = sum(max(0., float(o['qty']) - float(o.get('filled_qty') or 0)) * float(o.get('limit_price') or 0) * options_execution.order_multiplier(self, o) for o in orders if o['side'] == 'buy' and o['status'] not in TERMINAL)
         gross = sum(max(float(p['market_value']), float(p.get('cost_basis') or 0)) for p in positions)
         current_account = self.broker.account()
         available = min(float(current_account['cash']) - reservation, self.config['capital'] - gross - reservation) - self.config['capital'] * self.config['cash_reserve_fraction']
+        if 'options' in self.state['strategies']:
+            available -= options_execution.policy_config(self.config)['fee_contingency']
         for sleeve in ('swing', 'intraday'):
             if sleeve not in signals or (sleeve == 'intraday' and (now.hour, now.minute) >= (14, 30)):
                 continue
@@ -293,5 +353,6 @@ class Engine:
                         used.add(symbol)
                 except ValueError as exc:
                     self.record({'event': 'entry_skipped', 'at': now.isoformat(), 'sleeve': sleeve, 'symbol': symbol, 'reason': str(exc)})
+        options_execution.enter(self, signals, now)
         self.save()
-        return self.snapshot(current_account, positions, clock, signals)
+        return self.snapshot(current_account, self.broker.positions(), clock, signals)

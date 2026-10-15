@@ -29,9 +29,27 @@ def weekly_research_due(now, last_research, market_open):
     return not last_research or timestamp(last_research).astimezone(NY).date() < local.date()
 
 
+def _stock_parameter_snapshot(strategies):
+    """Keep the research incumbent scoped to the two researched stock sleeves.
+
+The nested ``params`` shape also accepts legacy pending candidates that saved
+all strategy metadata. Options accounting progresses independently and is not
+an incumbent for either stock research procedure.
+"""
+    if not isinstance(strategies, dict):
+        raise ValueError('Research incumbent strategies are missing.')
+    snapshot = {}
+    for name in ('swing', 'intraday'):
+        strategy = strategies.get(name)
+        if not isinstance(strategy, dict) or not isinstance(strategy.get('params'), dict):
+            raise ValueError('Research incumbent stock parameters are missing.')
+        snapshot[name] = {'params': copy.deepcopy(strategy['params'])}
+    return snapshot
+
+
 def learn(state, daily, minute, directory, now, defer=False):
     results = {}
-    incumbent = copy.deepcopy(state['strategies'])
+    incumbent = _stock_parameter_snapshot(state['strategies'])
     for name, module, bars in [('swing', swing, daily), ('intraday', intraday, minute)]:
         result = module.research(bars, incumbent=state['strategies'][name]['params'])
         results[name] = result
@@ -57,8 +75,15 @@ def apply_pending_research(state, directory, now, market_open):
     evaluated = timestamp(pending['evaluated_at']).astimezone(NY)
     if local.date() == evaluated.date() and local.hour < 16:
         return None
-    # A changed incumbent or week-old proposal must be reevaluated, not applied.
-    if now - evaluated >= timedelta(days=7) or state['strategies'] != pending['incumbent']:
+    # Compare only parameters actually researched, including for legacy pending
+    # snapshots containing whole strategies. Missing incumbents fail closed.
+    try:
+        incumbent_matches = (_stock_parameter_snapshot(state['strategies']) ==
+                             _stock_parameter_snapshot(pending.get('incumbent')))
+    except ValueError:
+        incumbent_matches = False
+    # A changed stock incumbent or week-old proposal must be reevaluated.
+    if now - evaluated >= timedelta(days=7) or not incumbent_matches:
         state['events'].append({'event': 'research_candidate_discarded', 'at': now.isoformat(), 'reason': 'stale_or_incumbent_changed'})
         state.pop('pending_research')
         write_json(directory / 'state.json', state)
@@ -144,7 +169,12 @@ def main():
             if run_id:
                 try:
                     bootstrap(archive, run_id, directory, broker)
-                    capture_fills(archive, run_id, broker, directory, state, now)
+                    before_collection = copy.deepcopy(state)
+                    try:
+                        capture_fills(archive, run_id, broker, directory, state, now)
+                    finally:
+                        if before_collection != state:
+                            engine.save()
                 except Exception as exc:
                     engine.audit_available = False
                     message = 'Trade evidence collection failed; new entries blocked: ' + str(exc)
@@ -194,6 +224,10 @@ def main():
                         write_json(directory / 'latest.json', snap)
                         raise
             snap['last_research'] = state['last_research']
+            snap.update(paused=state['paused'], halted=state['halted'], events=state['events'][-30:])
+            if any(v.get('manual_review_required') for v in state['strategies'].get('options', {}).get('lifecycle_reviews', {}).values()):
+                engine.alerts.append('Option lifecycle activity requires manual inventory reconciliation; new entries remain paused.')
+            snap['alerts'] = list(dict.fromkeys(snap.get('alerts', []) + engine.alerts))
             if signals is not None:
                 write_json(directory / 'selection.json', {'at': now.isoformat(), 'signals': signals})
             selection = read_json(directory / 'selection.json', {})

@@ -25,6 +25,9 @@ _SYMBOL = re.compile(r"^[A-Z][A-Z0-9.\-]{0,14}$")
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _CID = re.compile(r"^zoh-[A-Za-z0-9_-]{1,44}$")
 _ACTIVITY_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+_OPTION_SYMBOL = re.compile(r"^([A-Z]{1,6})([0-9]{6})([CP])([0-9]{8})$")
+_OPTION_QUOTE_PATH = "/v1beta1/options/quotes/latest"
+_OPTION_LIFECYCLE_TYPES = ("OPEXC", "OPTRD", "OPASN", "OPEXP")
 
 
 class BrokerError(RuntimeError):
@@ -117,6 +120,33 @@ def _identifier(value: str) -> str:
     return value
 
 
+def _option_symbol(value: str) -> str:
+    """Only unadjusted OCC symbols with a real expiry and positive strike."""
+    match = _OPTION_SYMBOL.fullmatch(value) if isinstance(value, str) else None
+    try:
+        if match is None or int(match[4]) <= 0:
+            raise ValueError()
+        date = match[2]
+        dt.date(2000 + int(date[:2]), int(date[2:4]), int(date[4:6]))
+    except ValueError:
+        raise BrokerError("Invalid standard US option symbol.") from None
+    return value
+
+
+def _option_price(value) -> str:
+    """Options limits must be exact cents; never round up an entry's risk."""
+    try:
+        if isinstance(value, bool):
+            raise ValueError()
+        amount = Decimal(str(value))
+        if (not amount.is_finite() or amount <= 0 or amount > Decimal("10000000")
+                or amount != amount.quantize(Decimal("0.01"))):
+            raise ValueError()
+        return format(amount.quantize(Decimal("0.01")), "f")
+    except (ValueError, InvalidOperation, TypeError):
+        raise BrokerError("Option limit prices must be finite positive whole cents.") from None
+
+
 def _date(value) -> str:
     try:
         text = value.isoformat() if isinstance(value, dt.date) else str(value)
@@ -191,10 +221,17 @@ class PaperBroker:
             return status, b""
 
     def _request(self, method, path, *, data=False, params=None, payload=None):
-        if not isinstance(path, str) or not path.startswith("/v2/") or "?" in path or "#" in path:
+        if (not isinstance(path, str) or "?" in path or "#" in path
+                or not (path.startswith("/v2/") or data and path == _OPTION_QUOTE_PATH)):
             raise BrokerError("Invalid fixed-endpoint API path.")
         if method not in {"GET", "POST", "DELETE"} or (data and method != "GET"):
             raise BrokerError("API operation is not permitted.")
+        if data:
+            stock_quote = re.fullmatch(r"/v2/stocks/[A-Z][A-Z0-9.\-]{0,14}/quotes/latest", path)
+            if path not in {"/v2/stocks/bars", _OPTION_QUOTE_PATH} and not stock_quote:
+                raise BrokerError("Market data endpoint is not permitted.")
+            if path == _OPTION_QUOTE_PATH and (not params or params.get("feed") != "indicative"):
+                raise BrokerError("Only the free indicative option feed is permitted.")
         url = (DATA_HOST if data else PAPER_HOST) + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
@@ -225,6 +262,12 @@ class PaperBroker:
                     error = BrokerError
                 raise error(f"Paper API {method} failed (HTTP {status}).", status=status)
             if status == 204:
+                return None
+            # The DNE API documents successful HTTP 200 without a response body.
+            # Only this fixed mutation may treat an empty 200 as success; orders
+            # must still provide an identifier or remain ambiguous.
+            if (status == 200 and not raw and method == "POST" and not data
+                    and re.fullmatch(r"/v2/positions/[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}/do-not-exercise", path)):
                 return None
             try:
                 return json.loads(raw)
@@ -325,6 +368,140 @@ class PaperBroker:
     def asset(self, symbol: str) -> dict:
         return self._object(self._request("GET", "/v2/assets/" + _symbol(symbol)))
 
+    def option_contracts(self, underlying: str, expiration_from, expiration_to) -> list:
+        """Complete eligible standard chain, with explicit inclusive expiries.
+
+        Both calls and puts are requested. Nontradable, inactive and adjusted
+        contracts are excluded, without shortening pagination. Raw fields of
+        eligible contracts are retained for the engine's point-in-time archive.
+        https://docs.alpaca.markets/us/reference/get-options-contracts
+        """
+        underlying = _symbol(underlying)
+        start, end = _date(expiration_from), _date(expiration_to)
+        if start > end:
+            raise BrokerError("Option expiration range must be chronological.")
+        params = {"underlying_symbols": underlying, "status": "active",
+                  "expiration_date_gte": start, "expiration_date_lte": end, "limit": 1000}
+        result, symbols, tokens = [], set(), set()
+        for _ in range(1000):
+            page = self._object(self._request("GET", "/v2/options/contracts", params=params))
+            rows = self._list(page.get("option_contracts"))
+            if len(rows) > 1000:
+                raise ResponseIncomplete("Option contract page exceeded the requested size.")
+            for row in rows:
+                symbol = row.get("symbol")
+                if not isinstance(symbol, str) or not symbol or symbol in symbols:
+                    raise ResponseIncomplete("Option contract pagination has an invalid or repeated symbol.")
+                symbols.add(symbol)
+                try:
+                    expiry = _date(row.get("expiration_date"))
+                    size = Decimal(str(row.get("size")))
+                except (BrokerError, InvalidOperation, ValueError):
+                    raise ResponseIncomplete("Option contract metadata is incomplete.") from None
+                if (row.get("underlying_symbol") != underlying or not start <= expiry <= end
+                        or row.get("type") not in {"call", "put"}
+                        or not size.is_finite() or size <= 0
+                        or row.get("status") not in {"active", "inactive"}
+                        or not isinstance(row.get("tradable"), bool)):
+                    raise ResponseIncomplete("Option contract metadata does not match the requested chain.")
+                if size != 100 or not row["tradable"] or row["status"] != "active":
+                    continue
+                # Adjusted OCC roots (e.g. AAPL1) are outside this experiment.
+                match = _OPTION_SYMBOL.fullmatch(symbol)
+                if match is None:
+                    if not re.fullmatch(r"[A-Z][A-Z0-9]{0,5}[0-9]{6}[CP][0-9]{8}", symbol):
+                        raise ResponseIncomplete("Option contract has an invalid OCC symbol.")
+                    continue
+                if match[1] != underlying:
+                    continue
+                try:
+                    _option_symbol(symbol)
+                except BrokerError:
+                    raise ResponseIncomplete("Option contract has an invalid OCC symbol.") from None
+                expected_expiry = "20" + match[2][:2] + "-" + match[2][2:4] + "-" + match[2][4:6]
+                try:
+                    strike = Decimal(str(row.get("strike_price")))
+                except InvalidOperation:
+                    raise ResponseIncomplete("Option contract has an invalid strike price.") from None
+                if (expiry != expected_expiry or row["type"] != {"C": "call", "P": "put"}[match[3]]
+                        or not strike.is_finite() or strike != Decimal(match[4]) / 1000):
+                    raise ResponseIncomplete("Option contract symbol and metadata disagree.")
+                result.append(row)
+            token = page.get("next_page_token")
+            if token is None or token == "":
+                return result
+            if not isinstance(token, str) or len(token) > 4096 or token in tokens:
+                raise ResponseIncomplete("Option contract pagination did not advance.")
+            tokens.add(token)
+            params["page_token"] = token
+        raise ResponseIncomplete("Option contract pagination limit reached.")
+
+    def option_contract(self, contract: str) -> dict:
+        symbol = _option_symbol(contract)
+        value = self._object(self._request("GET", "/v2/options/contracts/" + symbol))
+        if value.get("symbol") != symbol:
+            raise ResponseIncomplete("Option contract response has an unexpected symbol.")
+        return value
+
+    def option_latest_quote(self, contract: str, feed="indicative") -> dict:
+        """Free reference quote only; it is not an executable OPRA quote.
+
+        Indicative trades are delayed and quotes are modified by the provider.
+        https://docs.alpaca.markets/us/reference/optionlatestquotes
+        """
+        symbol = _option_symbol(contract)
+        if feed != "indicative":
+            raise BrokerError("Only the free indicative option feed is permitted.")
+        value = self._object(self._request("GET", _OPTION_QUOTE_PATH, data=True,
+                                         params={"symbols": symbol, "feed": "indicative"}))
+        quotes = self._object(value.get("quotes"))
+        if set(quotes) != {symbol}:
+            raise ResponseIncomplete("Option quote response is missing or contains an unexpected symbol.")
+        quote = self._object(quotes[symbol])
+        if value.get("feed", "indicative") != "indicative" or quote.get("feed", "indicative") != "indicative":
+            raise ResponseIncomplete("Option quote response has an unexpected feed.")
+        # An explicit request-source annotation, not a claim of OPRA accuracy.
+        return {**quote, "feed": "indicative"}
+
+    def options_lifecycle_activities(self, after=None, until=None) -> list:
+        """Complete option NTAs, kept distinct from actual FILL executions.
+
+        NTA `date` can differ from creation/availability time, notably in PAPER.
+        Callers must overlap windows and archive applicable correction versions.
+        https://docs.alpaca.markets/us/reference/getaccountactivities-2
+        https://docs.alpaca.markets/us/docs/non-trade-activities-for-option-events
+        """
+        params = {"activity_types": ",".join(_OPTION_LIFECYCLE_TYPES),
+                  "direction": "asc", "page_size": 100}
+        for name, value in (("after", after), ("until", until)):
+            if value is not None:
+                boundary = _time_bound(value)
+                if len(boundary) != 10 and dt.datetime.fromisoformat(boundary.replace("Z", "+00:00")).tzinfo is None:
+                    raise BrokerError("Activity timestamps must include a timezone, or use YYYY-MM-DD.")
+                params[name] = boundary
+        result, seen = [], set()
+        for _ in range(10000):
+            rows = self._list(self._request("GET", "/v2/account/activities", params=params))
+            if not rows:
+                return result
+            if len(rows) > 100:
+                raise ResponseIncomplete("Option activity response exceeded the requested page size.")
+            for row in rows:
+                activity_id = row.get("id")
+                if (not isinstance(activity_id, str) or not _ACTIVITY_ID.fullmatch(activity_id)
+                        or activity_id in seen or row.get("activity_type") not in _OPTION_LIFECYCLE_TYPES):
+                    raise ResponseIncomplete("Option activity response has an invalid or repeated activity.")
+                try:
+                    date = _time_bound(row.get("date"))
+                    if len(date) != 10 and dt.datetime.fromisoformat(date.replace("Z", "+00:00")).tzinfo is None:
+                        raise BrokerError("Option activity timestamps require a timezone.")
+                except BrokerError:
+                    raise ResponseIncomplete("Option activity response has an invalid date.") from None
+                seen.add(activity_id)
+            result.extend(rows)
+            params["page_token"] = rows[-1]["id"]
+        raise ResponseIncomplete("Option activity pagination limit reached.")
+
     def daily_bars(self, symbols, start, end) -> dict[str, list]:
         return self._bars(symbols, start, end, "1Day")
 
@@ -417,6 +594,59 @@ class PaperBroker:
 
     def cancel_order(self, order_id: str) -> None:
         self._request("DELETE", "/v2/orders/" + _identifier(order_id))
+
+    def submit_option_order(self, payload: dict) -> dict:
+        """One standard long contract, one attempt, no automatic write retries.
+
+        The engine must prove ownership before selling, reserve premium/fees,
+        archive the intent, and reconcile ambiguous writes by client_order_id.
+        This deliberately does not broaden the equity submit_order validator.
+        """
+        required = {"symbol", "qty", "side", "type", "time_in_force",
+                    "client_order_id", "position_intent"}
+        allowed = required | {"limit_price", "order_class", "extended_hours"}
+        if not isinstance(payload, dict) or not required.issubset(payload) or set(payload) - allowed:
+            raise BrokerError("Option order payload has missing or unsupported fields.")
+        result = dict(payload)
+        result["symbol"] = _option_symbol(payload["symbol"])
+        qty = payload["qty"]
+        if isinstance(qty, bool) or not isinstance(qty, (int, str)) or str(qty) != "1":
+            raise BrokerError("The option experiment permits one whole contract per order.")
+        result["qty"] = "1"
+        cid = payload["client_order_id"]
+        if not isinstance(cid, str) or not _CID.fullmatch(cid):
+            raise BrokerError("Client order identifier must use the zoh- prefix and be at most 48 characters.")
+        if (payload["time_in_force"] != "day" or payload.get("order_class", "simple") != "simple"
+                or payload.get("extended_hours", False) is not False):
+            raise BrokerError("Option orders must be single-leg regular-hours DAY orders.")
+        if payload["side"] == "buy":
+            if payload["type"] != "limit" or payload["position_intent"] != "buy_to_open":
+                raise BrokerError("Option entries must be long buy-to-open limit orders.")
+            result["limit_price"] = _option_price(payload.get("limit_price"))
+            if Decimal(result["limit_price"]) * 100 > 1000:
+                raise BrokerError("Option entry premium exceeds the experiment's total capital ceiling.")
+        elif payload["side"] == "sell":
+            if payload["type"] not in {"market", "limit"} or payload["position_intent"] != "sell_to_close":
+                raise BrokerError("Option exits must be sell-to-close market or limit orders.")
+            if payload["type"] == "limit":
+                result["limit_price"] = _option_price(payload.get("limit_price"))
+            elif "limit_price" in payload:
+                raise BrokerError("Market option exits cannot include a limit price.")
+        else:
+            raise BrokerError("Unsupported option order side.")
+        value = self._request("POST", "/v2/orders", payload=result)
+        if not isinstance(value, dict) or not isinstance(value.get("id"), str) or not _ID.fullmatch(value["id"]):
+            raise OrderAmbiguous("Option order response lacks an identifier; reconcile by client order identifier.")
+        return value
+
+    def do_not_exercise(self, contract: str):
+        """Submit DNE once for a held long; ambiguous outcomes require review.
+
+        No exercise endpoint is exposed. The caller must persist the intent and
+        prove this position belongs to the option experiment before calling.
+        https://docs.alpaca.markets/us/reference/optiondonotexercise
+        """
+        return self._request("POST", "/v2/positions/" + _option_symbol(contract) + "/do-not-exercise")
 
     def get_order(self, order_id: str) -> dict:
         return self._object(self._request("GET", "/v2/orders/" + _identifier(order_id), params={"nested": "true"}))

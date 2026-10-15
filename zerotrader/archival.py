@@ -44,6 +44,13 @@ def bootstrap(archive, run_id, directory, broker):
 
 
 def capture_fills(archive, run_id, broker, directory, state, now):
+    """Collect actual FILL versions plus separate option lifecycle evidence.
+
+    Callers must persist any state change through Engine.save in a finally block
+    (CloudCoordinator._state_operation in the cloud). In particular a lifecycle
+    review pause must survive a later archive/cursor failure. This collector never
+    submits, cancels, exercises, adopts holdings or writes state.json itself.
+    """
     cursor_path = directory / 'fill-archive-cursor.json'
     cursor = read_json(cursor_path, {})
     after = (timestamp(cursor['last_successful_poll']) - timedelta(days=1)).isoformat() if cursor.get('last_successful_poll') else None
@@ -69,5 +76,80 @@ def capture_fills(archive, run_id, broker, directory, state, now):
                        'activity_hash': version, 'order_id': order_id, 'sleeve': sleeve}
         archive.event_once(run_id, 'broker_fill_attribution', attribution,
                            key='broker-fill-attribution:' + fill['id'] + ':' + fingerprint(attribution))
-    write_json(cursor_path, {'last_successful_poll': now.isoformat(), 'overlap_days': 1})
+    if 'options' in state.get('strategies', {}):
+        capture_options_lifecycle(archive, run_id, broker, state, now, cursor)
+        cursor.update(option_lifecycle_last_successful_poll=now.isoformat(), option_lifecycle_overlap_days=2)
+    cursor.update(last_successful_poll=now.isoformat(), overlap_days=1)
+    write_json(cursor_path, cursor)
     return len(fills)
+
+
+def capture_options_lifecycle(archive, run_id, broker, state, now, cursor):
+    """Versioned option NTAs are never FILLs or authority to adopt stock.
+
+    The provider's economic date may precede availability. Overlap the prior
+    successful poll by two full days, and keep every content correction under
+    its original activity ID. A newly observed lifecycle version latches only
+    new-entry pause; protective exits remain the engine's responsibility.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError('Option lifecycle polling requires a timezone-aware clock.')
+    previous = cursor.get('option_lifecycle_last_successful_poll')
+    anchor = timestamp(previous) if previous else now
+    if anchor.tzinfo is None or anchor.utcoffset() is None or anchor > now:
+        raise ValueError('Invalid option lifecycle polling cursor.')
+    activities = broker.options_lifecycle_activities(after=(anchor - timedelta(days=2)).isoformat(), until=now.isoformat())
+    if not isinstance(activities, list):
+        raise ValueError('Option lifecycle response must be a complete list.')
+    allowed = {'OPEXC', 'OPTRD', 'OPASN', 'OPEXP'}
+    strategy = state['strategies']['options']
+    if not isinstance(strategy, dict) or not isinstance(strategy.get('lifecycle_reviews', {}), dict):
+        raise ValueError('Invalid option lifecycle review ledger.')
+    observed_versions = set()
+    for activity in activities:
+        if (not isinstance(activity, dict) or not isinstance(activity.get('id'), str) or not activity['id']
+                or activity.get('activity_type') not in allowed or not isinstance(activity.get('date'), str)):
+            raise ValueError('Option lifecycle evidence requires an activity ID, type and economic date.')
+        economic = timestamp(activity['date'])
+        if len(activity['date']) != 10 and (economic.tzinfo is None or economic.utcoffset() is None):
+            raise ValueError('Option lifecycle timestamp must include a timezone.')
+        version = fingerprint(activity)
+        identity = activity['id'] + ':' + version
+        if identity in observed_versions:
+            continue
+        observed_versions.add(identity)
+        archive.event_once(run_id, 'broker_option_lifecycle_activity', {
+            'source': 'alpaca_option_non_trade_activities', 'activity_id': activity['id'],
+            'activity_hash': version, 'activity': activity, 'is_fill': False,
+            'economic_date_is_not_observation_time': True}, key='broker-option-lifecycle-raw-v1:' + identity)
+        symbol = activity.get('symbol')
+        entries = [cid for cid, intent in state.get('intents', {}).items()
+                   if intent.get('sleeve') == 'options' and intent.get('payload', {}).get('side') == 'buy'
+                   and isinstance(symbol, str) and intent['payload'].get('symbol') == symbol
+                   and intent.get('contract', {}).get('symbol') == symbol]
+        attribution = {'activity_id': activity['id'], 'activity_hash': version,
+            'source': 'local_exact_option_contract_lineage', 'entry_client_order_ids': sorted(entries),
+            'attributed_to_options_pilot': bool(entries), 'is_fill': False,
+            'underlying_stock_adopted': False, 'inventory_change_independently_reconciled': False}
+        archive.event_once(run_id, 'broker_option_lifecycle_attribution', attribution,
+                           key='broker-option-lifecycle-attribution-v1:' + identity + ':' + fingerprint(attribution))
+        notice_key = fingerprint({'activity_id': activity['id'], 'activity_hash': version})
+        reviews = strategy.setdefault('lifecycle_reviews', {})
+        if notice_key in reviews:
+            continue
+        # Pause before writing the diagnostic, so a diagnostic write failure is
+        # still captured by the caller's finally/save persistence boundary.
+        state['paused'] = True
+        alert = {'event': 'options_lifecycle_manual_review', 'at': now.isoformat(),
+                 'activity_id': activity['id'], 'activity_hash': version,
+                 'activity_type': activity['activity_type'], 'symbol': symbol,
+                 'is_fill': False, 'manual_review_required': True,
+                 'reason': 'Option expiration/exercise/assignment/trade lifecycle requires inventory reconciliation; no stock adopted.'}
+        archive.event_once(run_id, 'options_lifecycle_manual_review',
+                           {key: value for key, value in alert.items() if key != 'at'},
+                           key='option-lifecycle-review-v1:' + notice_key)
+        reviews[notice_key] = {'activity_id': activity['id'], 'activity_hash': version,
+                              'activity_type': activity['activity_type'], 'detected_at': now.isoformat(),
+                              'manual_review_required': True}
+        state['events'] = (state.get('events', []) + [alert])[-500:]
+    return len(observed_versions)

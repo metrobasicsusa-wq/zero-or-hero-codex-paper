@@ -14,6 +14,7 @@ from copy import deepcopy
 from datetime import timedelta
 import hashlib
 import math
+from decimal import InvalidOperation
 import re
 
 from .broker import BrokerError, OrderAmbiguous, OrderRejected
@@ -21,6 +22,7 @@ from .cloud_checkpoint import CheckpointReceipt, LoadedCheckpoint, _canonical, _
 from .data import NY, timestamp
 from .engine import Engine, TERMINAL, flatten
 from .risk import drawdown, validated_quote
+from . import options_execution
 
 
 class CloudDurabilityError(RuntimeError):
@@ -131,6 +133,8 @@ class CloudEngine(Engine):
         return False
 
     def _entry_clock_guard(self, sleeve, context):
+        if sleeve == 'options':
+            return options_execution.clock_guard(self, context)
         clock = self.broker.clock()
         now = timestamp(clock["timestamp"]).astimezone(NY)
         if (not clock["is_open"] or (now.hour, now.minute) < (9, 45)
@@ -143,6 +147,8 @@ class CloudEngine(Engine):
         return clock, now
 
     def _fresh_buy_guard(self, payload, sleeve, context, *, record=True):
+        if sleeve == 'options':
+            return options_execution.fresh_guard(self, payload, context, record=record)
         clock, now = self._entry_clock_guard(sleeve, context)
         account = self.broker.account()
         if account.get("id") != self.state["account_id"]:
@@ -173,10 +179,12 @@ class CloudEngine(Engine):
         active = {order["symbol"] for order in orders}
         if payload["symbol"] in held | active or any(float(position["qty"]) < 0 for position in positions):
             raise ValueError("Current inventory blocks entry.")
-        reserve = sum(max(0., float(order["qty"]) - float(order.get("filled_qty") or 0)) * float(order.get("limit_price") or 0)
+        reserve = sum(max(0., float(order["qty"]) - float(order.get("filled_qty") or 0)) * float(order.get("limit_price") or 0) * options_execution.order_multiplier(self, order)
                       for order in orders if order["side"] == "buy")
         gross = sum(max(float(position["market_value"]), float(position.get("cost_basis") or 0)) for position in positions)
         available = min(cash - reserve, self.config["capital"] - gross - reserve) - self.config["capital"] * self.config["cash_reserve_fraction"]
+        if 'options' in self.state['strategies']:
+            available -= options_execution.policy_config(self.config)['fee_contingency']
         budget = self.config[sleeve]["allocation"]
         belongs = lambda symbol: self.state["owners"].get(symbol, {}).get("sleeve") == sleeve
         exposure = sum(max(float(position["market_value"]), float(position.get("cost_basis") or 0)) for position in positions if belongs(position["symbol"]))
@@ -210,6 +218,10 @@ class CloudEngine(Engine):
         intent = {"payload": deepcopy(payload), "sleeve": sleeve, "status": "submitting", "created": now.isoformat()}
         self.state["intents"][cid] = intent
         self.state["owners"][payload["symbol"]] = {"sleeve": sleeve, "entry_cid": cid, "entry_day": now.date().isoformat()}
+        if sleeve == 'options':
+            metadata = options_execution.owner_metadata(context)
+            self.state['owners'][payload['symbol']].update(metadata)
+            intent.update(metadata)
         self.save()
         self.audit_event("order_intent", {"client_order_id": cid, "sleeve": sleeve, "payload": payload,
                          "strategy": self.state["strategies"].get(sleeve), "context": context})
@@ -235,7 +247,8 @@ class CloudEngine(Engine):
             raise CloudDurabilityError("No confirmed dispatch intent is available.")
         payload, cid = intent["payload"], intent["payload"]["client_order_id"]
         try:
-            order = self.broker.submit_order(deepcopy(payload))
+            order = (self.broker.submit_option_order(deepcopy(payload)) if intent['sleeve'] == 'options'
+                     else self.broker.submit_order(deepcopy(payload)))
         except OrderRejected as exc:
             self.audit_event("order_rejected", {"client_order_id": cid, "status": exc.status})
             intent["status"] = "rejected"
@@ -248,6 +261,13 @@ class CloudEngine(Engine):
             self.save()
             raise CloudDurabilityError("Broker outcome is uncertain; reconcile the original client order ID.") from None
         self.audit_event("order_response", {"client_order_id": cid, "sleeve": intent["sleeve"], "broker_order": order})
+        if intent['sleeve'] == 'options':
+            try:
+                options_execution.validate_order(intent, order)
+            except (ValueError, KeyError, TypeError, InvalidOperation):
+                intent['status'] = 'uncertain'
+                options_execution.inventory_problem(self)
+                return False
         intent.update(order_id=order["id"], status=order["status"])
         known = self.state.setdefault("known_order_ids", [])
         known.extend(row["id"] for row in flatten([order]) if row["id"] not in known)
@@ -263,6 +283,8 @@ class CloudEngine(Engine):
                   "sleeve": owner["sleeve"], "created": now.isoformat(), "status": "exit_prepared",
                   "exit_for": owner["entry_cid"], "reason": reason, "cancel_order_ids": [order["id"] for order in orders]}
         self.state["intents"][cid] = intent
+        if owner['sleeve'] == 'options':
+            intent.update({key: deepcopy(owner[key]) for key in ('asset_class', 'multiplier', 'contract')})
         self.audit_event("cloud_exit_prepared", deepcopy(intent))
         self.save()
         return intent

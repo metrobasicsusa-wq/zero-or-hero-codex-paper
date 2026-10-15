@@ -37,6 +37,7 @@ from .storage import ROOT, read_json
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+_OCC = re.compile(r"([A-Z]{1,6})([0-9]{6})([CP])([0-9]{8})\Z")
 _MAX_RESPONSE = 4 * 1024 * 1024
 _EPSILON = Decimal("0.00000001")
 _ERRORS = frozenset({"execution_context_invalid", "credentials_or_binding_invalid", "private_runtime_invalid",
@@ -140,16 +141,59 @@ def _number(value, *, positive=False):
         raise ReconciliationFailure("broker_response_invalid") from None
 
 
+def _option_terms(symbol):
+    """Only standard, unadjusted OCC contracts are within this pilot."""
+    match = _OCC.fullmatch(symbol) if isinstance(symbol, str) else None
+    try:
+        if match is None or int(match[4]) <= 0:
+            raise ValueError
+        compact = match[2]
+        expiry = datetime(2000 + int(compact[:2]), int(compact[2:4]), int(compact[4:])).date().isoformat()
+    except ValueError:
+        raise ReconciliationFailure("broker_response_invalid") from None
+    return match[1], expiry
+
+
+def _asset_class(row):
+    asset = row.get("asset_class", "us_equity")
+    if asset == "us_option":
+        _option_terms(row.get("symbol"))
+        if "multiplier" in row and _number(row["multiplier"]) != 100:
+            raise ReconciliationFailure("broker_response_invalid")
+    elif asset != "us_equity" or _OCC.fullmatch(str(row.get("symbol", ""))):
+        # Never silently value an option contract as a single stock share.
+        raise ReconciliationFailure("broker_response_invalid")
+    return asset
+
+
+def _option_owner(symbol, owner, intent):
+    underlying, expiry = _option_terms(symbol)
+    contract = owner.get("contract", {})
+    match = _OCC.fullmatch(symbol)
+    if (owner.get("asset_class") != "us_option" or _number(owner.get("multiplier")) != 100
+            or intent.get("asset_class") != "us_option" or _number(intent.get("multiplier")) != 100
+            or _number(intent["payload"].get("qty")) != 1
+            or not isinstance(contract, dict) or contract.get("symbol") != symbol
+            or contract.get("underlying_symbol") != underlying or contract.get("expiration_date") != expiry
+            or _number(contract.get("size")) != 100
+            or _number(contract.get("strike_price")) != Decimal(match[4]) / 1000
+            or contract.get("type") != ("call" if match[3] == "C" else "put")
+            or intent.get("contract") != contract):
+        raise ReconciliationFailure("order_identity_mismatch")
+    return expiry
+
+
 def _order_map(rows):
     result = {}
     for row in flatten(rows):
         if (not isinstance(row, dict) or not _ID.fullmatch(str(row.get("id", "")))
                 or row.get("side") not in ("buy", "sell") or not isinstance(row.get("symbol"), str)
-                or row.get("asset_class", "us_equity") != "us_equity"
                 or not isinstance(row.get("status"), str)):
             raise ReconciliationFailure("broker_response_invalid")
+        asset = _asset_class(row)
         qty, filled = _number(row.get("qty"), positive=True), _number(row.get("filled_qty") or 0)
-        if filled > qty or (row["id"] in result and result[row["id"]] != row):
+        if (filled > qty or (asset == "us_option" and (qty != 1 or filled not in (0, 1)))
+                or (row["id"] in result and result[row["id"]] != row)):
             raise ReconciliationFailure("broker_response_invalid")
         result[row["id"]] = row
     return result
@@ -158,14 +202,24 @@ def _order_map(rows):
 def _inventory_key(positions, orders):
     # Ignore mark-to-market movement, but retain quantities and executable terms.
     fields = ("id", "client_order_id", "symbol", "side", "type", "status", "qty", "filled_qty",
-              "limit_price", "stop_price", "order_class", "position_intent")
+              "limit_price", "stop_price", "order_class", "position_intent", "asset_class", "multiplier")
     order_map = _order_map(orders)
-    return (sorted((p["symbol"], str(_number(p["qty"]))) for p in positions),
+    return (sorted((p["symbol"], str(_number(p["qty"])), _asset_class(p), str(p.get("multiplier"))) for p in positions),
             sorted(tuple(str(order_map[key].get(field)) for field in fields) for key in order_map))
 
 
 def compare_observations(state, broker, config, cursor, expected_account, result, *, now):
     """Pure comparison: do not reconcile into or save the supplied state."""
+    option_config = config.get("options", {})
+    options_enabled = isinstance(option_config, dict) and option_config.get("enabled") is True
+    options_present = isinstance(option_config, dict) and bool(option_config)
+    sleeves = ("swing", "intraday", "options") if options_present else ("swing", "intraday")
+    if options_present:
+        if (_number(option_config.get("allocation"), positive=True) > 1000
+                or sum((_number(config[s]["allocation"], positive=True) for s in sleeves), Decimal(0)) > _number(config["capital"])):
+            raise ReconciliationFailure("risk_or_account_blocks_enable")
+    # Reserved contingency, not a claim that the broker charged this amount.
+    option_fee = _number(option_config.get("fee_allowance_per_contract", 10), positive=True) if options_present else Decimal(0)
     account, clock = broker.account(), broker.clock()
     if not hmac.compare_digest(hashlib.sha256(str(account.get("id", "")).encode()).hexdigest(), expected_account):
         raise ReconciliationFailure("account_mismatch")
@@ -186,10 +240,12 @@ def compare_observations(state, broker, config, cursor, expected_account, result
     known = set(state.get("known_order_ids", [])) | set(fills)
     for symbol, owner in state["owners"].items():
         intent = state["intents"].get(owner.get("entry_cid"))
-        if (owner.get("sleeve") not in ("swing", "intraday") or intent is None
+        if (owner.get("sleeve") not in sleeves or intent is None
                 or intent["sleeve"] != owner["sleeve"] or intent["payload"].get("symbol") != symbol
                 or intent["payload"].get("side") != "buy"):
             raise ReconciliationFailure("order_identity_mismatch")
+        if owner["sleeve"] == "options":
+            _option_owner(symbol, owner, intent)
     entry_ids = {owner["entry_cid"] for owner in state["owners"].values()}
     for cid, intent in state["intents"].items():
         if intent.get("order_id"):
@@ -210,6 +266,14 @@ def compare_observations(state, broker, config, cursor, expected_account, result
                 or (intent.get("order_id") and order.get("id") != intent["order_id"])
                 or (payload.get("limit_price") is not None
                     and _number(order.get("limit_price")) != _number(payload["limit_price"]))):
+            raise ReconciliationFailure("order_identity_mismatch")
+        if intent.get("sleeve") == "options":
+            if (not options_present or _asset_class(order) != "us_option"
+                    or intent.get("asset_class") != "us_option" or _number(intent.get("multiplier")) != 100
+                    or _number(payload.get("qty")) != 1
+                    or order.get("position_intent") != ("buy_to_open" if payload["side"] == "buy" else "sell_to_close")):
+                raise ReconciliationFailure("order_identity_mismatch")
+        elif _asset_class(order) != "us_equity":
             raise ReconciliationFailure("order_identity_mismatch")
         children = _order_map([order])
         if any(row["status"] == "replaced" for row in children.values()):
@@ -239,24 +303,57 @@ def compare_observations(state, broker, config, cursor, expected_account, result
         symbol = fill["symbol"]
         expected_qty[symbol] = expected_qty.get(symbol, Decimal(0)) + _number(fill["qty"]) * (1 if fill["side"] == "buy" else -1)
     actual_qty, gross = {}, Decimal(0)
-    exposures = {sleeve: Decimal(0) for sleeve in ("swing", "intraday")}
+    exposures = {sleeve: Decimal(0) for sleeve in sleeves}
     acquisition = {sleeve: Decimal(0) for sleeve in exposures}
     for position in positions:
         symbol, qty = position["symbol"], _number(position["qty"], positive=True)
-        if position.get("asset_class", "us_equity") != "us_equity":
+        asset = _asset_class(position)
+        if asset == "us_option" and (not options_present or qty != 1):
             raise ReconciliationFailure("broker_response_invalid")
         actual_qty[symbol] = qty
         owner = state["owners"].get(symbol)
         if not owner:
             result["unknown_positions"] += 1
             continue
+        if (asset == "us_option") != (owner["sleeve"] == "options"):
+            raise ReconciliationFailure("order_identity_mismatch")
         cost = _number(position["cost_basis"])
+        if asset == "us_option":
+            expiry = _option_owner(symbol, owner, state["intents"][owner["entry_cid"]])
+            if (expiry < observed.astimezone(NY).date().isoformat()
+                    or ("expiration_date" in position and position["expiration_date"] != expiry)):
+                raise ReconciliationFailure("order_identity_mismatch")
+            cost += option_fee
         value = max(_number(position["market_value"]), cost)
         gross += value
         exposures[owner["sleeve"]] += value
         acquisition[owner["sleeve"]] += cost
         if owner["sleeve"] == "intraday" and owner.get("entry_day") != observed.astimezone(NY).date().isoformat():
             result["overnight_intraday_positions"] += 1
+        if asset == "us_option":
+            # DNE is available only on expiry day. Ordinary same-session pilot
+            # inventory does not require it. Inventory retained overnight or
+            # within the mandatory expiry-exit window must still fail this
+            # read-only check, even if a DNE acknowledgement exists. Passing is
+            # not proof of a broker stop or continuous option-price protection.
+            session_day = observed.astimezone(NY).date()
+            expiry_day = datetime.fromisoformat(expiry).date()
+            session_exit_due = True
+            if clock.get("is_open") is True:
+                try:
+                    close = timestamp(clock["next_close"])
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    raise ReconciliationFailure("broker_response_invalid") from None
+                if (close.tzinfo is None or close.astimezone(NY).date() != session_day or close <= observed):
+                    raise ReconciliationFailure("broker_response_invalid")
+                # Use the broker's session close, including shortened sessions.
+                session_exit_due = observed >= close - timedelta(minutes=20)
+            if (owner.get("entry_day") != session_day.isoformat()
+                    or session_exit_due
+                    or expiry_day - session_day <= timedelta(days=2)
+                    or (expiry_day == session_day and owner.get("dne_status") != "acknowledged")):
+                result["unprotected_positions"] += 1
+            continue
         coverage = sum((_number(o["qty"]) - _number(o.get("filled_qty") or 0) for oid, o in open_orders.items()
                         if lineage.get(oid) == owner["entry_cid"] and o["symbol"] == symbol and o["side"] == "sell"
                         and o.get("type") == "stop" and o["status"] in ("new", "accepted", "accepted_for_bidding")
@@ -283,8 +380,12 @@ def compare_observations(state, broker, config, cursor, expected_account, result
                 or timestamp(fill["transaction_time"]).tzinfo is None):
             raise ReconciliationFailure("broker_response_invalid")
         seen.add(fill["id"])
-        _number(fill["qty"], positive=True)
+        fill_qty = _number(fill["qty"], positive=True)
         _number(fill["price"], positive=True)
+        if _OCC.fullmatch(str(fill.get("symbol", ""))):
+            _option_terms(fill["symbol"])
+            if fill_qty != 1 or fill.get("asset_class", "us_option") != "us_option":
+                raise ReconciliationFailure("broker_response_invalid")
         if (fill.get("order_id") not in known
                 or known_terms.get(fill.get("order_id")) != (fill.get("symbol"), fill["side"])):
             result["unknown_fill_orders"] += 1
@@ -309,6 +410,8 @@ def compare_observations(state, broker, config, cursor, expected_account, result
             raise ReconciliationFailure("broker_response_invalid")
         remaining = _number(order["qty"]) - _number(order.get("filled_qty") or 0)
         reserved = remaining * _number(order.get("limit_price"), positive=True)
+        if _asset_class(order) == "us_option":
+            reserved = reserved * 100 + (option_fee if remaining else Decimal(0))
         reservations[state["owners"][order["symbol"]]["sleeve"]] += reserved
     total_reserved = sum(reservations.values(), Decimal(0))
     peak = max(_number(state["equity_peak"], positive=True), equity)
@@ -331,6 +434,7 @@ def compare_observations(state, broker, config, cursor, expected_account, result
         "pending_buy_cash_limit": total_reserved > cash,
         "cash_reserve_limit": total_reserved > 0 and cash - total_reserved < capital * _number(config["cash_reserve_fraction"]),
         "overnight_intraday": bool(result["overnight_intraday_positions"]),
+        "options_entries_disabled": bool(not options_enabled and reservations.get("options", 0) > 0),
     }
     result["risk_check_failures"] = sorted(name for name, failed in checks.items() if failed)
     if result["risk_check_failures"]:

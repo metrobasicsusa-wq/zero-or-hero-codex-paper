@@ -306,7 +306,10 @@ class CloudCoordinator:
                 now = timestamp(snapshot["at"]).astimezone(NY)
                 try:
                     operations.bootstrap(self.archive, self.run_id, self.directory, observed_broker)
-                    operations.capture_fills(self.archive, self.run_id, observed_broker, self.directory, self.state, now)
+                    self._state_operation(engine, lambda: operations.capture_fills(
+                        self.archive, self.run_id, observed_broker, self.directory, self.state, now))
+                except CloudDurabilityError:
+                    raise
                 except Exception:
                     engine.audit_available = False
                     engine.alerts.append("Trade evidence collection failed; new entries blocked.")
@@ -357,6 +360,9 @@ class CloudCoordinator:
                             engine.audit_available = False
                         snapshot = engine.cycle(signals, execute=True)
                 snapshot["last_research"] = self.state["last_research"]
+                snapshot.update(paused=self.state['paused'], halted=self.state['halted'], events=self.state['events'][-30:])
+                if any(v.get('manual_review_required') for v in self.state['strategies'].get('options', {}).get('lifecycle_reviews', {}).values()):
+                    engine.alerts.append('Option lifecycle activity requires manual inventory reconciliation; new entries remain paused.')
                 snapshot["alerts"] = list(dict.fromkeys(snapshot.get("alerts", []) + engine.alerts))
                 if signals is not None:
                     write_json(self.directory / "selection.json", {"at": now.isoformat(), "signals": signals})
