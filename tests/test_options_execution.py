@@ -99,6 +99,138 @@ class FakeOptionBroker(FakeBroker):
 class OptionFixture:
     cloud = False
 
+    def enter_only(self, signal=None):
+        from zerotrader import options_execution
+        engine = self.engine()
+        options_execution.initialize(engine)
+        options_execution.enter(engine, signal or self.signals('AAPL'), self.broker.now)
+        return engine
+
+    def events(self, kind):
+        return [data for _, event_kind, data in self.audit.events if event_kind == kind]
+
+    def test_delayed_stock_submission_does_not_make_new_option_quote_future(self):
+        original = self.broker.submit_order
+        def delayed(payload):
+            result = original(payload)
+            if payload['symbol'] == 'AAPL':
+                self.broker.now += timedelta(seconds=20)
+            return result
+        self.broker.submit_order = delayed
+        self.engine().cycle(self.signals('AAPL'))
+        self.assertEqual(len(self.broker.option_submitted), 1)
+        self.assertEqual(self.broker.option_submitted[0]['qty'], '1')
+        self.assertEqual(self.broker.option_submitted[0]['limit_price'], '2.10')
+        self.assertTrue(self.events('options_entry_clock'))
+        self.assertFalse(self.events('options_entry_skipped'))
+
+    def test_delayed_chain_and_option_quote_requests_refresh_candidate_clock(self):
+        original = self.broker.option_contracts
+        def delayed(*args):
+            self.broker.now += timedelta(seconds=10)
+            return original(*args)
+        self.broker.option_contracts = delayed
+        self.enter_only()
+        self.assertEqual(len(self.broker.option_submitted), 1)
+        clocks = self.events('options_entry_clock')
+        self.assertNotEqual(clocks[0]['clock']['timestamp'], clocks[1]['clock']['timestamp'])
+
+    def test_invalid_underlying_quote_is_archived_before_detailed_skip(self):
+        for age in (91, -6):
+            with self.subTest(age=age):
+                self.broker.quote_age = age
+                self.enter_only()
+                error = self.events('options_entry_skipped')[-1]
+                self.assertEqual(error['phase'], 'underlying_quote_validation')
+                self.assertEqual(error['reason_type'], 'ValueError')
+                self.assertIn('stale or from the future', error['reason'])
+                self.assertFalse(error['new_order_sent'])
+                self.assertEqual(self.events('options_quote_observed')[-1]['quote'],
+                                 self.broker.latest_quote('AAPL'))
+        self.assertEqual(self.broker.option_submitted, [])
+        self.assertEqual(self.state['intents'], {})
+
+    def test_missing_quote_timestamp_retains_raw_quote_and_key_error(self):
+        self.broker.latest_quote = lambda symbol: {'bp': 100, 'ap': 100.01}
+        self.enter_only()
+        error = self.events('options_entry_skipped')[-1]
+        self.assertEqual(error['reason_type'], 'KeyError')
+        self.assertIn('t', error['reason'])
+        self.assertNotIn('t', self.events('options_quote_observed')[-1]['quote'])
+        self.assertEqual(self.broker.option_submitted, [])
+
+    def test_invalid_option_quote_has_explicit_candidate_rejection(self):
+        self.broker.option_quote_age = 91
+        self.enter_only()
+        decision = self.events('options_candidate_decision')[-1]
+        self.assertEqual(decision['selected_count'], 0)
+        self.assertIn('stale or from the future', decision['diagnostics'][0]['reason'])
+        self.assertTrue(any(e['phase'] == 'candidate_option' for e in self.events('options_quote_observed')))
+        self.assertEqual(self.broker.option_submitted, [])
+
+    def test_expensive_candidate_is_logged_without_relaxing_240_cap(self):
+        original = self.broker.option_latest_quote
+        def expensive(*args, **kwargs):
+            return dict(original(*args, **kwargs), bp=4.0, ap=4.1)
+        self.broker.option_latest_quote = expensive
+        self.enter_only()
+        rejection = self.events('options_candidate_decision')[-1]['diagnostics'][0]
+        self.assertEqual(rejection['reason'], 'premium_above_cap')
+        self.assertEqual(rejection['cap'], 240)
+        self.assertEqual(self.broker.option_submitted, [])
+
+    def test_signal_expiring_during_quote_fetch_blocks_entry(self):
+        signals = self.signals('AAPL')
+        original = self.broker.latest_quote
+        def delayed(symbol):
+            self.broker.now += timedelta(seconds=900)
+            return original(symbol)
+        self.broker.latest_quote = delayed
+        self.enter_only(signals)
+        self.assertIn('signal expired', self.events('options_entry_skipped')[-1]['reason'])
+        self.assertEqual(self.broker.option_submitted, [])
+
+    def test_entry_window_ending_during_chain_fetch_blocks_entry(self):
+        self.broker.now = self.broker.now.replace(hour=14, minute=29, second=55)
+        original = self.broker.option_contracts
+        def delayed(*args):
+            self.broker.now += timedelta(seconds=6)
+            return original(*args)
+        self.broker.option_contracts = delayed
+        self.enter_only()
+        self.assertIn('window is closed', self.events('options_entry_skipped')[-1]['reason'])
+        self.assertEqual(self.broker.option_submitted, [])
+
+    def test_quote_evidence_failure_blocks_new_option_intent(self):
+        self.audit.fail.add('options_quote_observed')
+        engine = self.enter_only()
+        self.assertFalse(engine.audit_available)
+        self.assertEqual(self.state['intents'], {})
+        self.assertEqual(self.broker.option_submitted, [])
+
+    def test_candidate_quote_archival_delay_still_expires_old_underlying(self):
+        def delay(run_id, kind, payload):
+            if kind == 'options_quote_observed' and payload['phase'] == 'candidate_option':
+                self.broker.now += timedelta(seconds=91)
+        self.audit.observe = delay
+        self.enter_only()
+        self.assertEqual(self.broker.option_submitted, [])
+        self.assertIn('stale or from the future', self.events('options_candidate_decision')[-1]['diagnostics'][0]['reason'])
+
+    def test_pre_submit_quote_fetch_delay_does_not_use_old_clock(self):
+        original = self.broker.option_latest_quote
+        calls = 0
+        def delayed(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                self.broker.now += timedelta(seconds=6)
+            return original(*args, **kwargs)
+        self.broker.option_latest_quote = delayed
+        self.enter_only()
+        self.assertEqual(len(self.broker.option_submitted), 1)
+        self.assertTrue(any(e['phase'] == 'pre_submit_option' for e in self.events('options_quote_observed')))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.directory = Path(self.tmp.name)

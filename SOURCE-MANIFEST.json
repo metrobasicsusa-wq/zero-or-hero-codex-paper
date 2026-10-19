@@ -1,7 +1,7 @@
 {
   "format_version": 1,
-  "purpose": "code_only_paper_validation_and_bounded_options_pilot",
-  "source_date": "2026-10-15",
+  "purpose": "code_only_options_entry_clock_and_diagnostics_fix",
+  "source_date": "2026-10-19",
   "transformations": [
     {
       "path": "scripts/build_dashboard.py",
@@ -211,8 +211,8 @@
     },
     {
       "path": "tests/test_options_execution.py",
-      "bytes": 27775,
-      "sha256": "a0b371528885cfc586f673674853b2b0da118e378c51b4bf089c52d85cecb903"
+      "bytes": 34344,
+      "sha256": "34b8cade98d9293655d60a59c238c3518b537b3aea13c912c865293525cfb0bc"
     },
     {
       "path": "tests/test_options_lifecycle.py",
@@ -341,13 +341,13 @@
     },
     {
       "path": "zerotrader/options_execution.py",
-      "bytes": 22453,
-      "sha256": "6937cef480f5c385102b68ef5b56fa6b794c5b9943a34371cf5143767ccac5de"
+      "bytes": 26232,
+      "sha256": "4cbe53dbbeeea16fab28b5c0a7d9ef9e9eee25c4324f55d14685368a90a6a67a"
     },
     {
       "path": "zerotrader/options_pilot.py",
-      "bytes": 24026,
-      "sha256": "473c5937844a560b71f2abdcb6350a12073be21e7eb616dcbf717281f9a678c5"
+      "bytes": 24901,
+      "sha256": "febb922d52edf1dba006d0201ecfb304a71c9624115bfd7e3e434ff3023e0b23"
     },
     {
       "path": "zerotrader/report.py",

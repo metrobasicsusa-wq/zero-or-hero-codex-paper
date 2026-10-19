@@ -354,7 +354,7 @@ recycling any rejected/canceled reservation. No actual-FILL counts are returned.
             "sale_proceeds_reusable": False, "risk_ledger": {"version": 1, "orders": ledger}}
 
 
-def select_candidates(signals, contracts, quotes, underlying_quotes, now, config):
+def select_candidates(signals, contracts, quotes, underlying_quotes, now, config, *, diagnostics=None):
     """Return at most one affordable standard call per current stock signal.
 
 Signals are a list, or {'intraday': list}; no new stock signal is invented.
@@ -400,6 +400,9 @@ Invalid individual candidates are skipped; malformed config raises ValueError.
                     limit = Decimal(str(quote["ask"])).quantize(Decimal(".01"), rounding=ROUND_UP)
                     premium = limit * 100
                     if premium > Decimal(str(p["max_premium_per_contract"])):
+                        if diagnostics is not None:
+                            diagnostics.append({'symbol': parsed['symbol'], 'reason': 'premium_above_cap',
+                                                'premium': str(premium), 'cap': p['max_premium_per_contract']})
                         continue
                     eligible.append((distance, parsed["dte"], premium, parsed["symbol"], {
                         "symbol": parsed["symbol"], "underlying_symbol": underlying,
@@ -408,11 +411,18 @@ Invalid individual candidates are skipped; malformed config raises ValueError.
                         "fee_allowance": _money(Decimal(str(p["fee_allowance_per_contract"]))),
                         "signal": deepcopy(signal), "quote": quote, "limitations": list(LIMITATIONS),
                     }))
-                except (KeyError, TypeError, ValueError, AttributeError):
+                except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                    if diagnostics is not None:
+                        diagnostics.append({'symbol': contract.get('symbol') if isinstance(contract, dict) else None,
+                                            'phase': 'contract_quote_validation',
+                                            'reason_type': type(exc).__name__, 'reason': str(exc)[:500]})
                     continue
             if eligible:
                 chosen.append(min(eligible, key=lambda item: item[:4])[-1])
-        except (KeyError, TypeError, ValueError, AttributeError):
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            if diagnostics is not None:
+                diagnostics.append({'phase': 'underlying_signal_validation',
+                                    'reason_type': type(exc).__name__, 'reason': str(exc)[:500]})
             continue
     unique = {}
     for candidate in chosen:

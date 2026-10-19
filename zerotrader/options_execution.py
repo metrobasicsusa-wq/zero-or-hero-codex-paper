@@ -145,14 +145,57 @@ def annotated_positions(engine, positions):
     return result
 
 
-def clock_guard(engine, context):
+ENTRY_CLOCK_VERSION = '2026-10-19.1'
+
+
+def entry_clock(engine, signal, phase):
+    """Read broker time AFTER inputs arrive; never use the cycle-start clock."""
     policy = policy_config(engine.config)
     clock = engine.broker.clock()
+    if not engine.audit_event('options_entry_clock', {
+            'version': ENTRY_CLOCK_VERSION, 'phase': phase,
+            'underlying': signal.get('symbol'), 'signal_time': signal.get('signal_time'),
+            'clock': clock}):
+        raise ValueError('Options decision-clock archive failed; entry blocked.')
     now = timestamp(clock['timestamp']).astimezone(NY)
     if (not policy['enabled'] or not clock['is_open'] or (now.hour, now.minute) < (9, 45)
             or (now.hour, now.minute) >= (14, 30)
             or now >= timestamp(clock['next_close']) - timedelta(minutes=45)):
         raise ValueError('Options entry window is closed.')
+    if not 0 <= (now - timestamp(signal['signal_time'])).total_seconds() < 900:
+        raise ValueError('Options underlying signal expired or is from the future.')
+    return clock, now
+
+
+def entry_quote(engine, symbol, quote, phase, feed):
+    if not engine.audit_event('options_quote_observed', {
+            'version': ENTRY_CLOCK_VERSION, 'symbol': symbol, 'phase': phase,
+            'quote': quote, 'feed': feed, 'executable_quotes': False}):
+        raise ValueError('Options quote archive failed; entry blocked.')
+
+
+def entry_error(engine, exc, phase, underlying, **extra):
+    # Broker exception text may contain transport details. Keep status/type only;
+    # validation exceptions are local and their explicit reason stays private.
+    reason = ('Broker request failed.' if isinstance(exc, BrokerError) else str(exc)[:500])
+    engine.audit_event('options_entry_skipped', {
+        'version': ENTRY_CLOCK_VERSION, 'phase': phase, 'underlying': underlying,
+        'reason_type': type(exc).__name__, 'reason': reason,
+        'broker_status': getattr(exc, 'status', None), 'feed': 'indicative', **extra})
+
+
+def clock_guard(engine, context):
+    try:
+        return _clock_guard(engine, context)
+    except (ValueError, KeyError, TypeError, InvalidOperation, BrokerError) as exc:
+        entry_error(engine, exc, 'pre_submit_context', context.get('signal', {}).get('symbol'),
+                    new_order_sent=False)
+        raise
+
+
+def _clock_guard(engine, context):
+    policy = policy_config(engine.config)
+    clock, now = entry_clock(engine, context['signal'], 'pre_submit_context')
     validated_option_quote(context['quote'], now, policy)
     validated_quote(context['underlying_quote'], now, engine.config)
     validate_contract(context['contract'], now, policy)
@@ -162,6 +205,15 @@ def clock_guard(engine, context):
 
 
 def fresh_guard(engine, payload, context, *, record=True):
+    try:
+        return _fresh_guard(engine, payload, context, record=record)
+    except (ValueError, KeyError, TypeError, InvalidOperation, BrokerError) as exc:
+        entry_error(engine, exc, 'pre_submit', context.get('signal', {}).get('symbol'),
+                    symbol=payload.get('symbol'), new_order_sent=False)
+        raise
+
+
+def _fresh_guard(engine, payload, context, *, record=True):
     """Recheck the whole account after durable intent, including its own reservation."""
     from .engine import TERMINAL, flatten
     policy = policy_config(engine.config)
@@ -226,6 +278,10 @@ def fresh_guard(engine, payload, context, *, record=True):
                                                        'per_contract_premium_cap_exceeded'}):
         raise ValueError('Options entry exceeds reserved capital or contract allowance.')
     fresh_quote = engine.broker.option_latest_quote(payload['symbol'], feed='indicative')
+    entry_quote(engine, payload['symbol'], fresh_quote, 'pre_submit_option', 'indicative')
+    # Account/persistence work and the quote request may take several seconds.
+    # Recheck original inputs AND the new quote against a new broker clock.
+    clock, now = clock_guard(engine, context)
     checked = validated_option_quote(fresh_quote, now, policy)
     if number(checked['ask']) > number(payload['limit_price']):
         raise ValueError('Indicative quote moved above persisted entry limit.')
@@ -340,18 +396,21 @@ def enter(engine, signals, now):
         underlying = signal['symbol']
         if underlying in attempted_today or underlying not in engine.config['intraday_universe']:
             continue
+        phase = 'underlying_quote_fetch'
         try:
-            if not 0 <= (now - timestamp(signal['signal_time'])).total_seconds() < 900:
-                continue
             underlying_quote = engine.broker.latest_quote(underlying)
-            bid, ask = validated_quote(underlying_quote, now, engine.config)
+            entry_quote(engine, underlying, underlying_quote, 'underlying', 'iex')
+            phase = 'underlying_quote_validation'
+            _, quote_now = entry_clock(engine, signal, phase)
+            bid, ask = validated_quote(underlying_quote, quote_now, engine.config)
+            phase = 'contract_fetch'
             contracts = engine.broker.option_contracts(underlying,
-                (now.date() + timedelta(days=policy['min_dte'])).isoformat(),
-                (now.date() + timedelta(days=policy['max_dte'])).isoformat())
+                (quote_now.date() + timedelta(days=policy['min_dte'])).isoformat(),
+                (quote_now.date() + timedelta(days=policy['max_dte'])).isoformat())
             eligible = []
             for contract in contracts:
                 try:
-                    validate_contract(contract, now, policy)
+                    validate_contract(contract, quote_now, policy)
                     strike = float(contract['strike_price'])
                     if contract['type'] == 'call' and abs(strike / ((bid + ask) / 2) - 1) <= policy['max_moneyness_fraction']:
                         eligible.append(contract)
@@ -359,19 +418,33 @@ def enter(engine, signals, now):
                     continue
             eligible.sort(key=lambda c: (c['expiration_date'], abs(float(c['strike_price']) - (bid + ask) / 2)))
             eligible = eligible[:4]
-            quotes = {c['symbol']: engine.broker.option_latest_quote(c['symbol'], feed='indicative') for c in eligible}
-            engine.audit_event('options_candidate_inputs', {'underlying': underlying, 'signal': signal,
+            phase = 'option_quote_fetch'
+            quotes = {}
+            for contract in eligible:
+                symbol = contract['symbol']
+                quotes[symbol] = engine.broker.option_latest_quote(symbol, feed='indicative')
+                entry_quote(engine, symbol, quotes[symbol], 'candidate_option', 'indicative')
+            phase = 'candidate_validation'
+            _, candidate_now = entry_clock(engine, signal, phase)
+            if not engine.audit_event('options_candidate_inputs', {'underlying': underlying, 'signal': signal,
                                'contracts': contracts, 'queried_shortlist': eligible,
                                'filter': 'standard active call, DTE7-21, strike within1pct; expiry then moneyness; first4',
                                'unqueried_contracts_not_evaluated': True,
                                'quotes': quotes, 'underlying_quote': underlying_quote,
-                               'feed': 'indicative', 'executable_quotes': False, 'stage': STAGE})
-            candidates = select_candidates([signal], eligible, quotes, {underlying: underlying_quote}, now, engine.config)
+                               'feed': 'indicative', 'executable_quotes': False, 'stage': STAGE,
+                               'decision_clock': candidate_now.isoformat(), 'version': ENTRY_CLOCK_VERSION}):
+                return
+            diagnostics = []
+            candidates = select_candidates([signal], eligible, quotes, {underlying: underlying_quote},
+                                           candidate_now, engine.config, diagnostics=diagnostics)
+            if not engine.audit_event('options_candidate_decision', {
+                    'version': ENTRY_CLOCK_VERSION, 'underlying': underlying,
+                    'decision_clock': candidate_now.isoformat(), 'selected_count': len(candidates),
+                    'queried_count': len(eligible), 'diagnostics': diagnostics}):
+                return
             for candidate in candidates[:1]:
-                clock = engine.broker.clock()
-                decision_now = timestamp(clock['timestamp']).astimezone(NY)
-                if not clock['is_open'] or (decision_now.hour, decision_now.minute) >= (14, 30):
-                    return
+                phase = 'intent_preparation'
+                _, decision_now = entry_clock(engine, signal, phase)
                 symbol = candidate['symbol']
                 contract = next(c for c in eligible if c['symbol'] == symbol)
                 cid = 'zoh-opt-' + now.strftime('%Y%m%d') + '-' + hashlib.sha256(symbol.encode()).hexdigest()[:12]
@@ -385,11 +458,13 @@ def enter(engine, signals, now):
                 payload = {'symbol': symbol, 'qty': '1', 'side': 'buy', 'position_intent': 'buy_to_open',
                     'type': 'limit', 'time_in_force': 'day', 'limit_price': candidate['limit_price'],
                     'client_order_id': cid}
+                phase = 'submit'
                 engine.submit(payload, 'options', decision_now)
+                phase = 'post_submit_reconciliation'
                 synchronize_ledger(engine, engine.broker.positions())
                 attempted_today.add(underlying)
-        except (ValueError, KeyError, TypeError, BrokerError) as exc:
+        except (ValueError, KeyError, TypeError, InvalidOperation, BrokerError) as exc:
             # Errors remain evidence. No market order fallback or subscription switch.
-            engine.audit_event('options_entry_skipped', {'underlying': underlying, 'reason_type': type(exc).__name__,
-                               'feed': 'indicative', 'new_order_sent': False})
+            entry_error(engine, exc, phase, underlying,
+                        new_order_sent=None if phase in ('submit', 'post_submit_reconciliation') else False)
 
