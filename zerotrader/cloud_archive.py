@@ -359,6 +359,7 @@ class VerifiedArchiveCache:
     def __init__(self):
         self._model = None
         self._identities = []
+        self._encoded_rows = {}
 
     def fork(self):
         other = VerifiedArchiveCache()
@@ -366,7 +367,58 @@ class VerifiedArchiveCache:
         # application creates fresh dictionaries/lists rather than editing them.
         other._model = self._model
         other._identities = list(self._identities)
+        other._encoded_rows = dict(self._encoded_rows)
         return other
+
+
+def _snapshot_hash(model, encoded_rows):
+    """Hash the EXACT v1 canonical JSON, re-encoding only changed immutable rows.
+
+    No hash or generation check is skipped. The cache is process-local and
+    compares row values before reusing bytes; it is never read from disk.
+    Batching updates avoids one hashlib call per small cell/row and avoids
+    allocating another full archive JSON string for every historical generation.
+    """
+    digest = hashlib.sha256()
+    buffer = bytearray()
+
+    def emit(raw):
+        buffer.extend(raw)
+        if len(buffer) >= 1024 * 1024:
+            digest.update(buffer)
+            buffer.clear()
+
+    emit(b'{')
+    for number, key in enumerate(sorted(model)):
+        if number:
+            emit(b',')
+        emit(_json(key) + b':')
+        if key != 'tables':
+            emit(_json(model[key]))
+            continue
+        emit(b'{')
+        for table_number, table in enumerate(sorted(model['tables'])):
+            if table_number:
+                emit(b',')
+            emit(_json(table) + b':[')
+            for row_number, row in enumerate(model['tables'][table]):
+                if row_number:
+                    emit(b',')
+                identity = (table, row[0])
+                cached = encoded_rows.get(identity)
+                if cached is None or cached[0] != row:
+                    # Retain an independent immutable-value copy. A caller
+                    # mutating a row cannot trick the equality check later.
+                    raw = _json(row)
+                    cached = (json.loads(raw), raw)
+                    encoded_rows[identity] = cached
+                emit(cached[1])
+            emit(b']')
+        emit(b'}')
+    emit(b'}')
+    if buffer:
+        digest.update(buffer)
+    return digest.hexdigest()
 
 
 def _check_cached_package(path, digest, manifest):
@@ -377,6 +429,102 @@ def _check_cached_package(path, digest, manifest):
         packed = _read_file(directory / chunk['name'], manifest['chunk_limit'])
         if len(packed) != chunk['bytes'] or _hash(packed) != chunk['sha256']:
             _fail('A previously verified package chunk changed.')
+
+
+def seed_restore_point(packages, point_path, target_cache, *, trusted=None):
+    """Verify a compact row index plus every original package and BLOB.
+
+    Immutable BLOB bytes are read from the original chain, never duplicated in
+    the point. Cold restore deeply validates the complete assembled snapshot,
+    then binds its exact canonical hash to the authenticated original anchor.
+    Historical prefix snapshots need not be rebuilt hundreds of times. All
+    original versions remain available; new tail generations use normal checks.
+    """
+    if target_cache._model is not None or target_cache._identities or not packages:
+        _fail('A fresh cache and complete original prefix are required.')
+    point, payload, point_digest = _read_package(point_path)
+    if (point['kind'] != 'restore-point' or point['generation'] != len(packages) - 1
+            or not isinstance(payload['rows'], dict) or set(payload['rows']) != set(TABLES)
+            or payload['rows']['blobs'] != [] or payload['run_before'] != {}):
+        _fail('Compact restore point layout is invalid.')
+    if trusted is not None and len(trusted._identities) == len(packages):
+        _chain(packages, cache=trusted)
+        identities = list(trusted._identities)
+        blobs = trusted._model['tables']['blobs']
+        previous = trusted._model
+        target_cache._encoded_rows = dict(trusted._encoded_rows)
+    else:
+        identities, blob_index, parent = [], {}, None
+        for generation, path in enumerate(packages):
+            manifest, original, digest = _read_package(path)
+            if (manifest['generation'] != generation or manifest['parent'] != parent
+                    or manifest['kind'] != ('baseline' if generation == 0 else 'incremental')
+                    or any(manifest[k] != point[k] for k in ('schema', 'user_version', 'application_id'))
+                    or not isinstance(original['rows'], dict) or set(original['rows']) != set(TABLES)):
+                _fail('Restore point prefix lineage does not match.')
+            for row in original['rows']['blobs']:
+                if (not isinstance(row, list) or len(row) != len(TABLES['blobs'])
+                        or not isinstance(row[0], str) or row[0] in blob_index):
+                    _fail('Original immutable blob lineage is invalid.')
+                blob_index[row[0]] = row
+            identities.append((digest, manifest))
+            parent = digest
+        blobs = sorted(blob_index.values(), key=lambda row: row[0])
+        previous = None
+    anchor_digest, anchor = identities[-1]
+    model = {k: point[k] for k in ('schema', 'user_version', 'application_id')}
+    model.update(tables=dict(payload['rows'], blobs=blobs), sequences=payload['sequences'])
+    _validate(model, previous=previous)
+    if (point['parent'] != anchor_digest
+            or point['snapshot_sha256'] != anchor['snapshot_sha256']
+            or point['counts'] != anchor['counts']
+            or _snapshot_hash(model, target_cache._encoded_rows) != anchor['snapshot_sha256']
+            or _counts(model) != anchor['counts']):
+        _fail('Compact restore point does not match original snapshot.')
+    target_cache._model = model
+    target_cache._identities = identities
+    return {'manifest_sha256': point_digest, 'snapshot_sha256': point['snapshot_sha256'],
+            'generation': point['generation'], 'counts': point['counts']}
+
+
+def export_restore_point(cache, destination, *, chunk_limit=MAX_CHUNK_BYTES):
+    """Write only final row indexes, reusing immutable BLOBs in original history."""
+    if (not isinstance(cache, VerifiedArchiveCache) or cache._model is None or not cache._identities
+            or not isinstance(chunk_limit, int) or isinstance(chunk_limit, bool)
+            or not 256 <= chunk_limit <= MAX_CHUNK_BYTES):
+        _fail('A verified archive and valid chunk limit are required.')
+    destination = Path(destination)
+    if destination.exists():
+        _fail('Restore point destination already exists.')
+    model = cache._model
+    anchor_digest, anchor = cache._identities[-1]
+    payload = {'rows': dict(model['tables'], blobs=[]), 'run_before': {}, 'sequences': model['sequences']}
+    raw = _json(payload)
+    raw_limit = chunk_limit - chunk_limit // 1000 - 128
+    chunks, packed = [], []
+    for offset in range(0, len(raw), raw_limit):
+        part = raw[offset:offset + raw_limit]
+        chunk = gzip.compress(part, compresslevel=6, mtime=0)
+        if len(chunk) > chunk_limit:
+            _fail('Restore point chunk exceeds its bound.')
+        digest = _hash(chunk)
+        chunks.append({'name': 'chunk-' + str(len(chunks)).zfill(6) + '-' + digest + '.gz',
+                       'sha256': digest, 'bytes': len(chunk), 'raw_bytes': len(part)})
+        packed.append(chunk)
+    manifest = dict(anchor, kind='restore-point', parent=anchor_digest,
+                    payload_sha256=_hash(raw), chunks=chunks, chunk_limit=chunk_limit)
+    manifest_raw = _json(manifest)
+    if len(manifest_raw) > MAX_MANIFEST_BYTES:
+        _fail('Restore point manifest exceeds its bound.')
+    destination.mkdir(mode=0o700, parents=False, exist_ok=False)
+    for descriptor, chunk in zip(chunks, packed):
+        _write_new(destination / descriptor['name'], chunk)
+    _write_new(destination / 'manifest.json', manifest_raw)
+    checked, observed, digest = _read_package(destination)
+    if checked != manifest or observed != payload:
+        _fail('Restore point local readback mismatch.')
+    return {'manifest_sha256': digest, 'snapshot_sha256': anchor['snapshot_sha256'],
+            'generation': anchor['generation'], 'counts': anchor['counts']}
 
 
 def _chain(packages, *, cache=None):
@@ -443,7 +591,7 @@ def _chain(packages, *, cache=None):
         # Verify the baseline in full once; subsequent generations deeply check
         # only additions/finalizations after exact immutable-row comparison.
         _validate(model, previous=prior)
-        if _counts(model) != manifest['counts'] or _hash(_json(model)) != manifest['snapshot_sha256']:
+        if _counts(model) != manifest['counts'] or _snapshot_hash(model, cache._encoded_rows) != manifest['snapshot_sha256']:
             _fail('Reconstructed snapshot hash or row counts do not match.')
         last_hash, last_manifest = digest, manifest
         identities.append((digest, manifest))

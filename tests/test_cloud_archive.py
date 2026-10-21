@@ -46,6 +46,59 @@ class CloudArchiveTests(unittest.TestCase):
         receipt = cloud.export_archive(self.archive.path, destination, parents=parents, chunk_limit=limit)
         return destination, receipt
 
+    def test_compact_restore_point_reuses_original_blobs_and_validates_cold_snapshot(self):
+        first, _ = self.export('first')
+        self.archive.finish_run(self.run, 'completed', {'synthetic_equity': 99999})
+        second, expected = self.export('second', [first])
+        cache = cloud.VerifiedArchiveCache()
+        cloud.verify_packages([first, second], cache=cache)
+        point = self.root / 'point'
+        cloud.export_restore_point(cache, point, chunk_limit=4096)
+        manifest, payload, _ = cloud._read_package(point)
+        self.assertEqual(payload['rows']['blobs'], [])
+        self.assertEqual(manifest['kind'], 'restore-point')
+        restored = cloud.VerifiedArchiveCache()
+        with patch.object(cloud, '_gunzip', wraps=cloud._gunzip) as decode:
+            cloud.seed_restore_point([first, second], point, restored)
+        self.assertGreater(decode.call_count, len(manifest['chunks']))
+        self.assertEqual(restored._model, cache._model)
+        self.assertEqual(cloud.verify_packages([first, second], cache=restored), expected)
+        with self.assertRaises(cloud.ArchivePackageError):
+            cloud.verify_packages([point])
+
+    def test_compact_restore_point_forged_rows_rejected_even_with_valid_chunk_hash(self):
+        first, _ = self.export('first')
+        cache = cloud.VerifiedArchiveCache()
+        cloud.verify_packages([first], cache=cache)
+        point = self.root / 'point'
+        cloud.export_restore_point(cache, point)
+        manifest, payload, _ = cloud._read_package(point)
+        payload['rows']['samples'][0][7] = 'forged-selection'
+        raw = cloud._json(payload)
+        packed = gzip.compress(raw, mtime=0)
+        digest = hashlib.sha256(packed).hexdigest()
+        name = 'chunk-000000-' + digest + '.gz'
+        (point / name).write_bytes(packed)
+        manifest['chunks'] = [{'name': name, 'sha256': digest, 'bytes': len(packed), 'raw_bytes': len(raw)}]
+        manifest['payload_sha256'] = hashlib.sha256(raw).hexdigest()
+        self.write_manifest(point, manifest)
+        target = cloud.VerifiedArchiveCache()
+        with self.assertRaises(cloud.ArchivePackageError):
+            cloud.seed_restore_point([first], point, target)
+        self.assertIsNone(target._model)
+
+    def test_compact_restore_point_requires_original_history_and_correct_anchor(self):
+        first, _ = self.export('first')
+        self.archive.finish_run(self.run, 'completed', {'synthetic_equity': 99999})
+        second, _ = self.export('second', [first])
+        cache = cloud.VerifiedArchiveCache()
+        cloud.verify_packages([first, second], cache=cache)
+        point = self.root / 'point'
+        cloud.export_restore_point(cache, point)
+        for packages in ([second], [second, first], [first]):
+            with self.assertRaises(cloud.ArchivePackageError):
+                cloud.seed_restore_point(packages, point, cloud.VerifiedArchiveCache())
+
     def restored(self, packages, name='restored.sqlite3'):
         path = self.root / name
         receipt = cloud.restore_archive(packages, path)
@@ -482,6 +535,31 @@ class CloudArchiveTests(unittest.TestCase):
         chunk.write_bytes(chunk.read_bytes()[:-1])
         with self.assertRaises(cloud.ArchivePackageError):
             cloud.verify_packages([baseline, delta], cache=cache)
+
+    def test_streamed_hash_matches_canonical_at_every_generation_and_mutation(self):
+        cache = {}
+        model = cloud._source_snapshot(self.archive.path)
+        self.assertEqual(cloud._snapshot_hash(model, cache), cloud._hash(cloud._json(model)))
+        first = deepcopy(model)
+        self.archive.finish_run(self.run, 'completed', {'equity': 100001})
+        model = cloud._source_snapshot(self.archive.path)
+        self.assertEqual(cloud._snapshot_hash(model, cache), cloud._hash(cloud._json(model)))
+        # Mutations, row ordering and JSON escaping must never reuse stale bytes.
+        model['tables']['blobs'][0][1] = 'changed\n"Unicode 测试'
+        self.assertEqual(cloud._snapshot_hash(model, cache), cloud._hash(cloud._json(model)))
+        model['tables']['blobs'].reverse()
+        self.assertEqual(cloud._snapshot_hash(model, cache), cloud._hash(cloud._json(model)))
+        self.assertEqual(cloud._snapshot_hash(first, cache), cloud._hash(cloud._json(first)))
+
+    def test_hash_cache_fork_does_not_advance_original_encoded_rows(self):
+        baseline, expected = self.export('hash-fork-baseline')
+        cache = cloud.VerifiedArchiveCache()
+        cloud.verify_packages([baseline], cache=cache)
+        fork = cache.fork()
+        self.archive.finish_run(self.run, 'completed', {'equity': 99999})
+        current = cloud._source_snapshot(self.archive.path)
+        cloud._snapshot_hash(current, fork._encoded_rows)
+        self.assertEqual(cloud._snapshot_hash(cache._model, cache._encoded_rows), expected['snapshot_sha256'])
 
 
 if __name__ == '__main__':

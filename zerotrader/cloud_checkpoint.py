@@ -389,24 +389,41 @@ class GitCheckpointStore:
             if self._head(directory) != receipt.commit:
                 raise CheckpointConflict("Checkpoint changed before archive readback.")
             self._fetch(directory, receipt.commit)
-            for path in paths:
-                spec = receipt.commit + ":" + path
-                kind = self._git(directory, "cat-file", "-t", spec)
-                if kind.returncode or kind.stdout.strip() != b"blob":
-                    raise CheckpointCorrupt("Required archive file is missing or invalid.")
-                size = self._checked(directory, "cat-file", "-s", spec)
+            specs = [(receipt.commit + ":" + path).encode("ascii") for path in paths]
+            request = b"".join(spec + b"\n" for spec in specs)
+            # Determine all sizes before requesting content. One bounded batch
+            # replaces three subprocesses per file, with unchanged byte limits.
+            metadata = self._checked(directory, "cat-file", "--batch-check", data=request).splitlines() if paths else []
+            if len(metadata) != len(paths):
+                raise CheckpointCorrupt("Archive metadata readback was incomplete.")
+            descriptors = []
+            for path, line in zip(paths, metadata):
                 try:
-                    length = int(size.strip())
-                except ValueError:
-                    raise CheckpointCorrupt("Invalid archive file size.") from None
+                    oid, kind, size = line.split()
+                    length = int(size)
+                    if kind != b"blob" or not _oid(oid.decode("ascii")):
+                        raise ValueError
+                except (ValueError, UnicodeError):
+                    raise CheckpointCorrupt("Required archive file is missing or invalid.") from None
                 limit = MAX_BYTES if path == ARCHIVE_INDEX_PATH else MAX_BUNDLE_FILE_BYTES
                 if not 0 <= length <= limit or total + length > MAX_BUNDLE_WRITE_BYTES:
                     raise CheckpointCorrupt("Archive readback exceeds its size limit.")
-                content = self._checked(directory, "cat-file", "blob", spec)
-                if len(content) != length:
-                    raise CheckpointCorrupt("Archive file readback was incomplete.")
-                result[path] = content
+                descriptors.append((oid, length))
                 total += length
+            content = self._checked(directory, "cat-file", "--batch", data=request) if paths else b""
+            offset = 0
+            for path, (oid, length) in zip(paths, descriptors):
+                end = content.find(b"\n", offset)
+                expected = oid + b" blob " + str(length).encode("ascii")
+                if end < 0 or content[offset:end] != expected:
+                    raise CheckpointCorrupt("Archive content framing does not match its metadata.")
+                offset = end + 1
+                if content[offset + length:offset + length + 1] != b"\n":
+                    raise CheckpointCorrupt("Archive file readback was incomplete.")
+                result[path] = content[offset:offset + length]
+                offset += length + 1
+            if offset != len(content):
+                raise CheckpointCorrupt("Archive content has unexpected trailing bytes.")
             if self._head(directory) != receipt.commit:
                 raise CheckpointConflict("Checkpoint changed during archive readback.")
         return result

@@ -338,6 +338,10 @@ class CloudBundleTests(unittest.TestCase):
 
     def test_cached_commit_reads_new_packages_and_proves_old_remote_objects(self):
         initial = self.bootstrap()
+        # Establish a full restore point first; ordinary tail commits still
+        # reuse verified old content without inflating old market inputs.
+        self.archive.event(self.run, 'synthetic-establish-point', {'n': 1})
+        initial = self.bundle.commit(self.state, self.archive.path, expected_head=initial.commit)
         old_prefix = 'archive/packages/' + initial.archive_manifest_sha256 + '/'
         with closing(sqlite3.connect(self.archive.path)) as db:
             old_market_blob = db.execute(
@@ -395,6 +399,66 @@ class CloudBundleTests(unittest.TestCase):
         self.assertEqual(one.read_bytes(), original)
         self.assertEqual(self.new_bundle().restore(two).receipt, receipt)
         self.assertEqual(cloud_archive._source_snapshot(one), cloud_archive._source_snapshot(two))
+
+    def test_restore_point_keeps_original_history_and_restores_exact_state(self):
+        first = self.bootstrap()
+        original = self.index(first)['packages']
+        self.archive.finish_run(self.run, 'completed', {'equity': 100123.45})
+        second = self.bundle.commit(self.state, self.archive.path, expected_head=first.commit)
+        index = self.index(second)
+        self.assertEqual(index['version'], 2)
+        self.assertEqual(index['packages'][:len(original)], original)
+        self.assertEqual(index['restore_point']['generation'], second.generation)
+        fresh = self.new_bundle()
+        with patch('zerotrader.cloud_archive.seed_restore_point', wraps=cloud_archive.seed_restore_point) as seeded:
+            restored = fresh.restore_recovery(self.root / 'point-restored.sqlite3')
+        self.assertEqual(seeded.call_count, 1)
+        self.assertEqual(restored.state, self.state)
+        self.assertFalse(restored.entries_allowed)
+        self.assertEqual(cloud_archive._source_snapshot(self.root / 'point-restored.sqlite3'),
+                         cloud_archive._source_snapshot(self.archive.path))
+        self.archive.event(self.run, 'synthetic-tail', {'n': 2})
+        third = self.bundle.commit(self.state, self.archive.path, expected_head=second.commit)
+        self.assertEqual(self.index(third)['restore_point'], index['restore_point'])
+        self.assertEqual(self.new_bundle().restore(self.root / 'tail-restored.sqlite3').receipt, third)
+
+    def test_restore_point_cannot_hide_corrupted_original_chunk(self):
+        first = self.bootstrap()
+        self.archive.finish_run(self.run, 'completed', {'equity': 100123.45})
+        second = self.bundle.commit(self.state, self.archive.path, expected_head=first.commit)
+        index = self.index(second)
+        old = index['packages'][0]
+        prefix = 'archive/packages/' + old + '/'
+        manifest = json.loads(self.core.read_files(second, [prefix + 'manifest.json'])[prefix + 'manifest.json'])
+        self.rewrite(prefix + manifest['chunks'][0]['name'], b'corrupt-history')
+        with self.assertRaises((BundleCorrupt, CheckpointCorrupt)):
+            self.new_bundle().restore(self.root / 'never-created.sqlite3')
+        self.assertFalse((self.root / 'never-created.sqlite3').exists())
+
+    def test_forged_restore_point_binding_fails_closed(self):
+        first = self.bootstrap()
+        self.archive.finish_run(self.run, 'completed', {'equity': 100123.45})
+        second = self.bundle.commit(self.state, self.archive.path, expected_head=first.commit)
+        index = self.index(second)
+        index['restore_point']['snapshot_sha256'] = '0' * 64
+        self.rewrite(ARCHIVE_INDEX_PATH, canonical(index))
+        with self.assertRaises(BundleCorrupt):
+            self.new_bundle().restore(self.root / 'forged-never-created.sqlite3')
+
+    def test_periodic_restore_point_is_bound_to_latest_generation(self):
+        first = self.bootstrap()
+        with patch('zerotrader.cloud_bundle._RESTORE_POINT_INTERVAL', 1):
+            self.archive.event(self.run, 'synthetic-point-one', {'n': 1})
+            second = self.bundle.commit(self.state, self.archive.path, expected_head=first.commit)
+            old = self.index(second)['restore_point']
+            self.archive.event(self.run, 'synthetic-point-two', {'n': 2})
+            third = self.bundle.commit(self.state, self.archive.path, expected_head=second.commit)
+        latest = self.index(third)
+        self.assertNotEqual(latest['restore_point']['package'], old['package'])
+        self.assertEqual(latest['restore_point']['generation'], third.generation)
+        self.assertTrue(self.core.prove_files_unchanged(third, second,
+            ['archive/packages/' + old['package'] + '/manifest.json']))
+        self.assertEqual(self.new_bundle().load().receipt, third)
 
 
 if __name__ == '__main__':

@@ -27,6 +27,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 
 from . import cloud_archive
 from .cloud_checkpoint import (
@@ -37,6 +38,7 @@ from .cloud_checkpoint import (
 
 _HASH = re.compile(r'[0-9a-f]{64}\Z')
 _CHUNK = re.compile(r'chunk-[0-9]{6}-[0-9a-f]{64}\.gz\Z')
+_RESTORE_POINT_INTERVAL = 32
 _READ_BATCH_FILES = 16  # Each core file is <=8 MiB; never request the entire history at once.
 _INDEX_FIELDS = {'version', 'state_sha256', 'packages', 'manifest_sha256',
                  'snapshot_sha256', 'generation', 'counts'}
@@ -126,8 +128,9 @@ def _index(raw):
     try:
         index = json.loads(raw)
         if (len(raw) > MAX_BYTES or _json(index) != raw or not isinstance(index, dict)
-                or set(index) != _INDEX_FIELDS or type(index['version']) is not int
-                or index['version'] != 1):
+                or type(index['version']) is not int
+                or index['version'] not in (1, 2)
+                or set(index) != (_INDEX_FIELDS | ({'restore_point'} if index['version'] == 2 else set()))):
             raise ValueError
         packages = index['packages']
         if (not isinstance(packages, list) or not packages
@@ -141,6 +144,13 @@ def _index(raw):
                 or set(index['counts']) != set(cloud_archive.TABLES)
                 or any(type(count) is not int or count < 0 for count in index['counts'].values())):
             raise ValueError
+        if index['version'] == 2:
+            point = index['restore_point']
+            if (not isinstance(point, dict) or set(point) != {'package', 'generation', 'snapshot_sha256'}
+                    or not _digest(point['package']) or point['package'] in packages
+                    or not _digest(point['snapshot_sha256']) or type(point['generation']) is not int
+                    or not 0 <= point['generation'] <= index['generation']):
+                raise ValueError
         return index
     except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
         raise BundleCorrupt('Bundle archive index is invalid.') from None
@@ -169,6 +179,8 @@ class GitBundleStore:
         self._cache = None
         self._archive_cache = cloud_archive.VerifiedArchiveCache()
         self._closed = False
+        self.restore_timings = {}
+        self._verified_restore_points = set()
 
     def close(self):
         if not self._closed:
@@ -233,7 +245,10 @@ class GitBundleStore:
 
     def _cache_paths(self):
         result = []
-        for digest in self._cache['index']['packages']:
+        digests = list(self._cache['index']['packages'])
+        if self._cache['index'].get('restore_point'):
+            digests.append(self._cache['index']['restore_point']['package'])
+        for digest in digests:
             directory = self._root / digest
             manifest = json.loads((directory / 'manifest.json').read_bytes())
             result.append(_prefix(digest) + 'manifest.json')
@@ -273,12 +288,37 @@ class GitBundleStore:
                 raise BundleCorrupt('Remote index differs from the submitted bundle.')
             if not allow_stale_index and index['state_sha256'] != receipt.state_sha256:
                 raise BundleCorrupt('Core state is newer than its archive evidence; a new bundle is required.')
+            started = time.monotonic()
             reused = self._reuse(receipt, index) if use_cache else []
             self._download(receipt, index['packages'][len(reused):])
+            point_verified_seconds = 0.0
+            point = index.get('restore_point')
+            if point and point['package'] not in self._verified_restore_points:
+                self._download(receipt, [point['package']])
+                point_started = time.monotonic()
+                point_cache = cloud_archive.VerifiedArchiveCache()
+                if self._archive_cache._model is not None:
+                    cloud_archive.verify_packages(
+                        [self._root / d for d in index['packages']], cache=self._archive_cache)
+                checked = cloud_archive.seed_restore_point(
+                    [self._root / d for d in index['packages'][:point['generation'] + 1]],
+                    self._root / point['package'], point_cache, trusted=self._archive_cache)
+                if (checked['generation'] != point['generation']
+                        or checked['snapshot_sha256'] != point['snapshot_sha256']):
+                    raise BundleCorrupt('Restore point does not match the original archive generation.')
+                if self._archive_cache._model is None:
+                    self._archive_cache = point_cache
+                self._verified_restore_points.add(point['package'])
+                point_verified_seconds = time.monotonic() - point_started
+            downloaded = time.monotonic()
             verified = cloud_archive.verify_packages(
                 [self._root / digest for digest in index['packages']], cache=self._archive_cache)
             if any(verified[key] != index[key] for key in ('manifest_sha256', 'snapshot_sha256', 'generation', 'counts')):
                 raise BundleCorrupt('Remote archive does not match its bundle index.')
+            if not use_cache:
+                self.restore_timings = {'package_read_seconds': round(downloaded - started - point_verified_seconds, 6),
+                                        'restore_point_verify_seconds': round(point_verified_seconds, 6),
+                                        'chain_verify_seconds': round(time.monotonic() - downloaded, 6)}
             # The final check is after local reconstruction, which can be slow.
             self.core.confirm(receipt)
             self._cache = {'receipt': receipt, 'index': index, 'raw': raw}
@@ -355,6 +395,26 @@ class GitBundleStore:
                 names = ['manifest.json'] + [chunk['name'] for chunk in manifest['chunks']]
                 files = {_prefix(digest) + name: (package / name).read_bytes() for name in names}
                 index = {'version': 1, 'state_sha256': _hash(state_raw), 'packages': digests + [digest], **verified}
+                point = self._cache['index'].get('restore_point') if self._cache else None
+                if verified['generation'] > 0 and (point is None or verified['generation'] - point['generation'] >= _RESTORE_POINT_INTERVAL):
+                    point_path = Path(scratch) / 'restore-point'
+                    current_cache = self._archive_cache.fork()
+                    cloud_archive.verify_packages(parents + [package], cache=current_cache)
+                    point_result = cloud_archive.export_restore_point(current_cache, point_path,
+                        chunk_limit=self.chunk_limit)
+                    if (point_result['snapshot_sha256'] != verified['snapshot_sha256']
+                            or point_result['counts'] != verified['counts']):
+                        raise BundleCorrupt('Source changed while preparing a full restore point.')
+                    point_digest = point_result['manifest_sha256']
+                    # A generation-zero baseline already is its own full snapshot.
+                    if point_digest not in index['packages']:
+                        point_manifest = json.loads((point_path / 'manifest.json').read_bytes())
+                        for name in ['manifest.json'] + [c['name'] for c in point_manifest['chunks']]:
+                            files[_prefix(point_digest) + name] = (point_path / name).read_bytes()
+                        point = {'package': point_digest, 'generation': verified['generation'],
+                                 'snapshot_sha256': verified['snapshot_sha256']}
+                if point is not None:
+                    index.update(version=2, restore_point=point)
                 index_raw = _json(index)
                 _index(index_raw)
                 files[ARCHIVE_INDEX_PATH] = index_raw
@@ -398,12 +458,14 @@ class GitBundleStore:
 
     def _restore_verified(self, target, evidence, counts):
         try:
+            started = time.monotonic()
             restored = cloud_archive.restore_archive(
                 [self._root / digest for digest in self._cache['index']['packages']], target,
                 cache=self._archive_cache)
             expected = {'manifest_sha256': evidence.archive_manifest_sha256,
                         'snapshot_sha256': evidence.archive_snapshot_sha256,
                         'generation': evidence.generation, 'counts': counts}
+            self.restore_timings['database_restore_seconds'] = round(time.monotonic() - started, 6)
             if restored != expected:
                 raise BundleCorrupt('Restored archive differs from the verified bundle.')
         except cloud_archive.ArchivePackageError:

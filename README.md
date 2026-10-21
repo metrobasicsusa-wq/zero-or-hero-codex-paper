@@ -73,8 +73,15 @@ but a cold start cannot execute any active exit if the full archive/cutover
 evidence cannot be restored. No continuous-service guarantee is made.
 
 The archive cache verifies old file hashes and compares every previous SQLite
-row; only repeated decoding of verified content is avoided. Cold restores and
-memory still scale with history. Synthetic tests and performance figures do not
+row; only repeated decoding of verified content is avoided. Compact restore points
+retain original package history and reuse its immutable BLOB bytes. A point stores
+final row indexes and binds the complete logical snapshot to an original generation.
+Cold recovery checks every original package, deeply validates the full assembled
+snapshot and its exact hash, then replays at most 31 subsequent generations.
+Intermediate prefix snapshots are not reconstructed again; their original bytes
+and versions remain available for forensic replay. No historical package is pruned.
+The first upgrade from a legacy chain still requires a full verification.
+Storage and memory still scale with history. Synthetic tests and performance figures do not
 prove real-account migration, lifetime free capacity or brokerage connectivity.
 Do not run a cloud worker alongside an existing worker.
 

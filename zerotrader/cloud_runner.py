@@ -39,6 +39,7 @@ from .risk import validate_config
 from .storage import ROOT, process_lock, read_json, write_json
 
 
+RESTORE_VERSION = "2026-10-21.1"
 CODE_REPOSITORY = "metrobasicsusa-wq/zero-or-hero-codex-paper"
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _OID = re.compile(r"[0-9a-f]{40}\Z")
@@ -148,6 +149,7 @@ class CloudCoordinator:
         self.expected_account_sha256 = expected_account_sha256
         self.receipt, self.failed, self.evidence_ready = receipt, False, False
         self.archive_degraded = False
+        self.startup_metrics = None
         self.archive, self.run_id = None, None
         if (not isinstance(receipt, CheckpointReceipt)
                 or receipt.state_sha256 != hashlib.sha256(_canonical(state)).hexdigest()):
@@ -169,10 +171,16 @@ class CloudCoordinator:
             raise CloudRunError("Cloud restoration requires a new empty private runtime.")
         archive_path = directory / "archive" / "research.sqlite3"
         archive_path.parent.mkdir()
+        started = time.monotonic()
         recovered = bundle.restore_recovery(archive_path)
+        recovered_at = time.monotonic()
         restore_auxiliary(archive_path, directory)
         result = cls(core, bundle, directory, deepcopy(recovered.state), recovered.receipt,
                      expected_account_sha256)
+        result.startup_metrics = {"restore_version": RESTORE_VERSION,
+                                  "bundle_restore_seconds": round(recovered_at - started, 6),
+                                  "auxiliary_and_binding_seconds": round(time.monotonic() - recovered_at, 6),
+                                  **getattr(bundle, "restore_timings", {})}
         write_json(directory / "state.json", result.state)
         return result
 
@@ -288,6 +296,9 @@ class CloudCoordinator:
                 try:
                     self.archive = ResearchArchive(self.directory)
                     self.run_id = self.archive.start_run("cloud_cycle", config, self.state["strategies"])
+                    if self.startup_metrics is not None:
+                        self.archive.event(self.run_id, "cloud_startup_timing", self.startup_metrics)
+                        self.startup_metrics = None
                 except Exception:
                     self.archive, self.run_id = None, None
                 observed_broker = _EvidenceBroker(broker, self.archive, self.run_id)

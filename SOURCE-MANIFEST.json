@@ -1,7 +1,7 @@
 {
   "format_version": 1,
-  "purpose": "code_only_options_entry_clock_and_diagnostics_fix",
-  "source_date": "2026-10-19",
+  "purpose": "code_only_paper_validation_and_bounded_options_pilot",
+  "source_date": "2026-10-21",
   "transformations": [
     {
       "path": "scripts/build_dashboard.py",
@@ -41,8 +41,8 @@
     },
     {
       "path": "README.md",
-      "bytes": 5034,
-      "sha256": "632803c2d7d7638d595c19c89b45c7f6806aafc7e9bc2188458dbe7076cdad5f"
+      "bytes": 5615,
+      "sha256": "6574736ec789a2ac8aa85b72d4307a12554d0f83321bf603f472edd7c6d84322"
     },
     {
       "path": "cloud-main/bootstrap_private_state.py",
@@ -116,8 +116,8 @@
     },
     {
       "path": "tests/test_cloud_archive.py",
-      "bytes": 29474,
-      "sha256": "00f9cbd4fb35790b8a36fabd9273b8b4d13b18912d6434a63ffe29ed6b3e4a9b"
+      "bytes": 33958,
+      "sha256": "eb4258b644152cfcd5be4daf3a96ac1ca808e9dd98ee50d06c2267bd467927ab"
     },
     {
       "path": "tests/test_cloud_auxiliary.py",
@@ -126,8 +126,8 @@
     },
     {
       "path": "tests/test_cloud_bundle.py",
-      "bytes": 23123,
-      "sha256": "36f7b1fc64c18b699ef8d6d7be7119c7195aa9aa66b3fc32f1a3328632cce558"
+      "bytes": 27272,
+      "sha256": "ba1c77a5b9908d5354689f9d37ab4ae7a9ac70771c35e03003f6e82047e5065c"
     },
     {
       "path": "tests/test_cloud_checkpoint.py",
@@ -136,8 +136,8 @@
     },
     {
       "path": "tests/test_cloud_checkpoint_files.py",
-      "bytes": 6314,
-      "sha256": "f6d1614baddd20634032d444dd605d628532c6338951e9eecc8fdf3db84ad9d8"
+      "bytes": 7665,
+      "sha256": "993e5296e5dc63b047630821510f3ba6de3263b8c5d7ebc0f31e7d5415176939"
     },
     {
       "path": "tests/test_cloud_cutover_preparation.py",
@@ -281,8 +281,8 @@
     },
     {
       "path": "zerotrader/cloud_archive.py",
-      "bytes": 30502,
-      "sha256": "503809aea3d89654e6df8c5f1cd88d043abd881fec30fa024365932f33330930"
+      "bytes": 38047,
+      "sha256": "516cbfc2411712d492cd8971d13ec5bea7c234f65afa8d3194d8ceb817dbef08"
     },
     {
       "path": "zerotrader/cloud_auxiliary.py",
@@ -291,13 +291,13 @@
     },
     {
       "path": "zerotrader/cloud_bundle.py",
-      "bytes": 19233,
-      "sha256": "164cec6740f7fdbdc91a379c32697af427b9503b2942a026ddef0e0919c15eb9"
+      "bytes": 23622,
+      "sha256": "207eb0a54a948c8df054f11565140544b597231323b34823874b231d433683f3"
     },
     {
       "path": "zerotrader/cloud_checkpoint.py",
-      "bytes": 28660,
-      "sha256": "a7bd71778c64f3c3e1c035f15409694bdce34419f565e89bade20e44c9550dcf"
+      "bytes": 29808,
+      "sha256": "26e566a47aad4154cc1658824e8ccd6e68a48bf1491a8afaf58200923a156d65"
     },
     {
       "path": "zerotrader/cloud_engine.py",
@@ -321,8 +321,8 @@
     },
     {
       "path": "zerotrader/cloud_runner.py",
-      "bytes": 27938,
-      "sha256": "7dc1f2a958b365d01f481376a2487266be7c43321fa3ecaf762d49b88f67c153"
+      "bytes": 28643,
+      "sha256": "8f0d71c838725dcb8220fcccc605dfceb93b0c0d86cdc7a50a040c7b8db85685"
     },
     {
       "path": "zerotrader/data.py",

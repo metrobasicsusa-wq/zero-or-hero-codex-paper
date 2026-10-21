@@ -106,3 +106,22 @@ class CheckpointFilesTests(unittest.TestCase):
         with self.assertRaises(CheckpointCorrupt):
             self.store.read_files(receipt, [self.package])
 
+
+    def test_many_files_use_two_cat_file_processes_and_exact_binary_framing(self):
+        files = {"archive/packages/" + format(n, "064x") + "/manifest.json": bytes(range(256)) + b"\n" for n in range(1, 25)}
+        receipt = self.store.bootstrap(self.state, files=files)
+        with patch.object(self.store, "_git", wraps=self.store._git) as calls:
+            self.assertEqual(self.store.read_files(receipt, list(files)), files)
+        invocations = [call.args[1:] for call in calls.call_args_list if len(call.args)>1 and call.args[1]=="cat-file"]
+        self.assertEqual(invocations, [("cat-file", "--batch-check"), ("cat-file", "--batch")])
+
+    def test_batch_rejects_truncated_or_mismatched_content(self):
+        receipt = self.store.bootstrap(self.state, files=self.files)
+        original = self.store._checked
+        for damage in (lambda raw: raw[:-1], lambda raw: b"bad\n" + raw, lambda raw: raw + b"extra"):
+            def checked(directory, *args, **kwargs):
+                raw = original(directory, *args, **kwargs)
+                return damage(raw) if args == ("cat-file", "--batch") else raw
+            with self.subTest(damage=damage), patch.object(self.store, "_checked", side_effect=checked):
+                with self.assertRaises(CheckpointCorrupt):
+                    self.store.read_files(receipt, list(self.files))
