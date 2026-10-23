@@ -21,6 +21,7 @@ from pathlib import Path
 import re
 import sqlite3
 import tempfile
+import time
 import zlib
 
 
@@ -164,7 +165,7 @@ def _index(rows):
     return result
 
 
-def _validate(model, *, previous=None):
+def _validate(model, *, previous=None, applied_rows=None):
     if not isinstance(model, dict) or set(model) != {'schema', 'tables', 'sequences', 'user_version', 'application_id'}:
         _fail('Unsupported logical snapshot layout.')
     schema = model['schema']
@@ -188,7 +189,11 @@ def _validate(model, *, previous=None):
     # A previously verified model is an in-process trust anchor, not a timestamp
     # watermark. Compare EVERY old row and all BLOB bytes before reusing it.
     # This also catches a writer that removed and recreated immutable triggers.
-    changes = _delta(previous, model)['rows'] if previous is not None else model['tables']
+    # Only _chain supplies applied_rows, after enforcing every immutable-row,
+    # run-finalization and sequence transition while constructing a fresh model.
+    # SQLite/export callers still compare all prior rows with _delta.
+    changes = (applied_rows if applied_rows is not None else
+               _delta(previous, model)['rows'] if previous is not None else model['tables'])
     indexed = {}
     for table, columns in TABLES.items():
         rows = model['tables'][table]
@@ -313,7 +318,13 @@ def _read_file(path, limit):
     return raw
 
 
-def _read_package(directory):
+def _elapsed(timings, key, started):
+    if timings is not None:
+        timings[key] = round(timings.get(key, 0.0) + time.monotonic() - started, 6)
+
+
+def _read_package(directory, *, timings=None, prefix='package'):
+    started = time.monotonic()
     directory = Path(directory)
     raw = _read_file(directory / 'manifest.json', MAX_MANIFEST_BYTES)
     manifest = _parse(raw)
@@ -327,8 +338,10 @@ def _read_package(directory):
     chunks = manifest['chunks']
     if not isinstance(chunks, list) or not chunks:
         _fail('Package chunks are missing.')
+    _elapsed(timings, prefix + '_manifest_seconds', started)
     parts = []
     for index, chunk in enumerate(chunks):
+        started = time.monotonic()
         if (not isinstance(chunk, dict) or set(chunk) != {'name', 'sha256', 'bytes', 'raw_bytes'}
                 or not isinstance(chunk['sha256'], str) or not _HASH.fullmatch(chunk['sha256'])
                 or chunk['name'] != 'chunk-' + str(index).zfill(6) + '-' + chunk['sha256'] + '.gz'
@@ -337,13 +350,18 @@ def _read_package(directory):
         packed = _read_file(directory / chunk['name'], limit)
         if len(packed) != chunk['bytes'] or _hash(packed) != chunk['sha256']:
             _fail('Package chunk hash or size does not match.')
+        _elapsed(timings, prefix + '_chunk_hash_seconds', started)
+        started = time.monotonic()
         parts.append(_gunzip(packed, chunk['raw_bytes']))
+        _elapsed(timings, prefix + '_inflate_seconds', started)
+    started = time.monotonic()
     payload_raw = b''.join(parts)
     if _hash(payload_raw) != manifest['payload_sha256']:
         _fail('Package payload SHA-256 does not match.')
     payload = _parse(payload_raw)
     if not isinstance(payload, dict) or set(payload) != {'rows', 'run_before', 'sequences'}:
         _fail('Package payload layout is invalid.')
+    _elapsed(timings, prefix + '_payload_parse_seconds', started)
     return manifest, payload, _hash(raw)
 
 
@@ -431,7 +449,7 @@ def _check_cached_package(path, digest, manifest):
             _fail('A previously verified package chunk changed.')
 
 
-def seed_restore_point(packages, point_path, target_cache, *, trusted=None):
+def seed_restore_point(packages, point_path, target_cache, *, trusted=None, timings=None):
     """Verify a compact row index plus every original package and BLOB.
 
     Immutable BLOB bytes are read from the original chain, never duplicated in
@@ -442,7 +460,7 @@ def seed_restore_point(packages, point_path, target_cache, *, trusted=None):
     """
     if target_cache._model is not None or target_cache._identities or not packages:
         _fail('A fresh cache and complete original prefix are required.')
-    point, payload, point_digest = _read_package(point_path)
+    point, payload, point_digest = _read_package(point_path, timings=timings, prefix='point')
     if (point['kind'] != 'restore-point' or point['generation'] != len(packages) - 1
             or not isinstance(payload['rows'], dict) or set(payload['rows']) != set(TABLES)
             or payload['rows']['blobs'] != [] or payload['run_before'] != {}):
@@ -456,7 +474,7 @@ def seed_restore_point(packages, point_path, target_cache, *, trusted=None):
     else:
         identities, blob_index, parent = [], {}, None
         for generation, path in enumerate(packages):
-            manifest, original, digest = _read_package(path)
+            manifest, original, digest = _read_package(path, timings=timings, prefix='prefix')
             if (manifest['generation'] != generation or manifest['parent'] != parent
                     or manifest['kind'] != ('baseline' if generation == 0 else 'incremental')
                     or any(manifest[k] != point[k] for k in ('schema', 'user_version', 'application_id'))
@@ -474,13 +492,17 @@ def seed_restore_point(packages, point_path, target_cache, *, trusted=None):
     anchor_digest, anchor = identities[-1]
     model = {k: point[k] for k in ('schema', 'user_version', 'application_id')}
     model.update(tables=dict(payload['rows'], blobs=blobs), sequences=payload['sequences'])
+    started = time.monotonic()
     _validate(model, previous=previous)
+    _elapsed(timings, 'point_model_validation_seconds', started)
+    started = time.monotonic()
     if (point['parent'] != anchor_digest
             or point['snapshot_sha256'] != anchor['snapshot_sha256']
             or point['counts'] != anchor['counts']
             or _snapshot_hash(model, target_cache._encoded_rows) != anchor['snapshot_sha256']
             or _counts(model) != anchor['counts']):
         _fail('Compact restore point does not match original snapshot.')
+    _elapsed(timings, 'point_snapshot_hash_seconds', started)
     target_cache._model = model
     target_cache._identities = identities
     return {'manifest_sha256': point_digest, 'snapshot_sha256': point['snapshot_sha256'],
@@ -527,7 +549,7 @@ def export_restore_point(cache, destination, *, chunk_limit=MAX_CHUNK_BYTES):
             'generation': anchor['generation'], 'counts': anchor['counts']}
 
 
-def _chain(packages, *, cache=None):
+def _chain(packages, *, cache=None, timings=None):
     if not packages:
         _fail('A complete baseline package chain is required.')
     if cache is None:
@@ -537,13 +559,19 @@ def _chain(packages, *, cache=None):
     identities = list(cache._identities)
     if len(packages) < len(identities):
         _fail('A verified package chain cannot be rewound or truncated.')
+    started = time.monotonic()
     for path, (digest, manifest) in zip(packages, identities):
         _check_cached_package(path, digest, manifest)
+    _elapsed(timings, 'cached_prefix_hash_seconds', started)
+    if timings is not None:
+        timings['replayed_generations'] = len(packages) - len(identities)
+        timings['cached_prefix_packages'] = len(identities)
     model = cache._model
     last_hash, last_manifest = identities[-1] if identities else (None, None)
     for generation in range(len(identities), len(packages)):
         path = packages[generation]
-        manifest, payload, digest = _read_package(path)
+        manifest, payload, digest = _read_package(path, timings=timings, prefix='tail')
+        started = time.monotonic()
         if (manifest['generation'] != generation or manifest['parent'] != last_hash
                 or manifest['kind'] != ('baseline' if generation == 0 else 'incremental')):
             _fail('Archive package chain is missing, reordered, or has the wrong parent.')
@@ -558,14 +586,20 @@ def _chain(packages, *, cache=None):
         else:
             if any(manifest[key] != model[key] for key in ('schema', 'user_version', 'application_id')):
                 _fail('Incremental schema or database metadata changed.')
+            old_sequences, new_sequences = dict(model['sequences']), dict(payload['sequences'])
+            if any(new_sequences.get(name, -1) < value for name, value in old_sequences.items()):
+                _fail('Incremental SQLite sequence metadata moves backwards.')
             merged = {}
             applied = set()
             for table in TABLES:
-                old = _index(model['tables'][table])
-                last_sequence = max(old, default=0) if table in ('events', 'samples', 'datasets') else None
                 additions = payload['rows'][table]
                 if not isinstance(additions, list):
                     _fail('Invalid incremental rows.')
+                if not additions:
+                    merged[table] = model['tables'][table]
+                    continue
+                old = _index(model['tables'][table])
+                last_sequence = max(old, default=0) if table in ('events', 'samples', 'datasets') else None
                 seen = set()
                 for row in additions:
                     if not isinstance(row, list) or len(row) != len(TABLES[table]) or not isinstance(row[0], (str, int)):
@@ -590,9 +624,14 @@ def _chain(packages, *, cache=None):
             model = dict(model, tables=merged, sequences=payload['sequences'])
         # Verify the baseline in full once; subsequent generations deeply check
         # only additions/finalizations after exact immutable-row comparison.
-        _validate(model, previous=prior)
+        _elapsed(timings, 'tail_merge_seconds', started)
+        started = time.monotonic()
+        _validate(model, previous=prior, applied_rows=payload['rows'] if prior is not None else None)
+        _elapsed(timings, 'tail_validation_seconds', started)
+        started = time.monotonic()
         if _counts(model) != manifest['counts'] or _snapshot_hash(model, cache._encoded_rows) != manifest['snapshot_sha256']:
             _fail('Reconstructed snapshot hash or row counts do not match.')
+        _elapsed(timings, 'tail_snapshot_hash_seconds', started)
         last_hash, last_manifest = digest, manifest
         identities.append((digest, manifest))
     cache._model = model
@@ -600,10 +639,10 @@ def _chain(packages, *, cache=None):
     return model, last_hash, last_manifest
 
 
-def verify_packages(packages, *, cache=None):
+def verify_packages(packages, *, cache=None, timings=None):
     """Verify an explicitly ordered local chain; hashes are not authentication."""
     try:
-        model, digest, manifest = _chain(list(packages), cache=cache)
+        model, digest, manifest = _chain(list(packages), cache=cache, timings=timings)
         return {'manifest_sha256': digest, 'snapshot_sha256': manifest['snapshot_sha256'],
                 'generation': manifest['generation'], 'counts': _counts(model)}
     except ArchivePackageError:
@@ -687,7 +726,7 @@ def _ddl_guard(action, first, second, database, trigger):
     return sqlite3.SQLITE_OK
 
 
-def restore_archive(packages, target, *, cache=None):
+def restore_archive(packages, target, *, cache=None, timings=None):
     """Rebuild baseline plus incrementals at a NEW offline path, never in place.
 
     Repeating restoration to a different new path is deterministic logically.
@@ -699,11 +738,12 @@ def restore_archive(packages, target, *, cache=None):
         _fail('Restore target or SQLite sidecars already exist; use a new offline path.')
     temporary = None
     try:
-        model, digest, manifest = _chain(list(packages), cache=cache)
+        model, digest, manifest = _chain(list(packages), cache=cache, timings=timings)
         if not target.parent.is_dir():
             _fail('Restore target parent directory must already exist.')
         handle, temporary = tempfile.mkstemp(prefix='.archive-restore-', suffix='.sqlite3', dir=target.parent)
         os.close(handle)
+        started = time.monotonic()
         with closing(sqlite3.connect(temporary)) as db:
             db.enable_load_extension(False)
             db.execute('PRAGMA foreign_keys=ON')
@@ -726,9 +766,12 @@ def restore_archive(packages, target, *, cache=None):
                 db.set_authorizer(None)
                 db.execute('PRAGMA user_version=' + str(model['user_version']))
                 db.execute('PRAGMA application_id=' + str(model['application_id']))
+        _elapsed(timings, 'sqlite_write_seconds', started)
+        started = time.monotonic()
         rebuilt = _source_snapshot(temporary, previous=model)
         if _hash(_json(rebuilt)) != manifest['snapshot_sha256']:
             _fail('Restored database failed exact logical readback.')
+        _elapsed(timings, 'sqlite_readback_seconds', started)
         # Hard-link installation is atomic and fails if target appeared meanwhile;
         # unlike replace/rename it can never overwrite existing evidence.
         os.link(temporary, target)

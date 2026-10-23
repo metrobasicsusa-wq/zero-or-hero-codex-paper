@@ -83,6 +83,20 @@ class FakeBundle:
 
 
 class CloudRunnerTests(unittest.TestCase):
+    def test_persistence_timing_waits_for_next_natural_cycle(self):
+        self.cycle()
+        metrics = deepcopy(self.coordinator.pending_cycle_metrics)
+        self.assertTrue(metrics['archive_complete'])
+        self.assertGreaterEqual(metrics['cycle_including_persistence_seconds'], metrics['final_bundle_seconds'])
+        self.assertGreaterEqual(metrics['bundle_persistence_seconds'], metrics['final_bundle_seconds'] * 0.99)
+        with self.archive._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE kind='cloud_previous_cycle_timing'").fetchone()[0], 0)
+        self.cycle()
+        with self.archive._connect() as db:
+            row = db.execute("SELECT payload_hash FROM events WHERE kind='cloud_previous_cycle_timing'").fetchone()
+            self.assertEqual(self.archive._get(db, row[0]), metrics)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM runs WHERE action='cloud_cycle'").fetchone()[0], 2)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="zoh-synthetic-coordinator-")
         self.addCleanup(self.temp.cleanup)

@@ -21,6 +21,7 @@ private visibility, execution lease or broker availability is promised here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -181,6 +182,7 @@ class GitBundleStore:
         self._closed = False
         self.restore_timings = {}
         self._verified_restore_points = set()
+        self._download_metrics = {}
 
     def close(self):
         if not self._closed:
@@ -200,6 +202,7 @@ class GitBundleStore:
             raise BundleError('Bundle store is closed.')
 
     def _put(self, digest, name, raw):
+        started = time.monotonic()
         directory = self._root / digest
         directory.mkdir(mode=0o700, exist_ok=True)
         path = directory / name
@@ -210,20 +213,25 @@ class GitBundleStore:
             with path.open('xb') as stream:
                 os.chmod(path, 0o600)
                 stream.write(raw)
+        cloud_archive._elapsed(self._download_metrics, 'package_cache_write_seconds', started)
         return path
 
-    def _read_batches(self, receipt, paths):
+    def _read_batches(self, receipt, paths, reader=None):
         for offset in range(0, len(paths), _READ_BATCH_FILES):
             batch = paths[offset:offset + _READ_BATCH_FILES]
-            fetched = self.core.read_files(receipt, batch)
+            started = time.monotonic()
+            fetched = reader(batch) if reader else self.core.read_files(receipt, batch)
+            cloud_archive._elapsed(self._download_metrics, 'package_git_read_seconds', started)
+            self._download_metrics['package_files_read'] = self._download_metrics.get('package_files_read', 0) + len(batch)
+            self._download_metrics['package_bytes_read'] = self._download_metrics.get('package_bytes_read', 0) + sum(len(fetched[p]) for p in batch)
             for path in batch:
                 yield path, fetched[path]
 
-    def _download(self, receipt, digests):
+    def _download(self, receipt, digests, reader=None):
         if not digests:
             return
         paths = []
-        for path, raw in self._read_batches(receipt, [_prefix(d) + 'manifest.json' for d in digests]):
+        for path, raw in self._read_batches(receipt, [_prefix(d) + 'manifest.json' for d in digests], reader):
             digest = path.split('/')[2]
             if len(raw) > cloud_archive.MAX_MANIFEST_BYTES or _hash(raw) != digest:
                 raise BundleCorrupt('Remote archive manifest hash does not match.')
@@ -239,7 +247,7 @@ class GitBundleStore:
                 raise BundleCorrupt('Remote archive chunk references are invalid.') from None
             self._put(digest, 'manifest.json', raw)
             paths.extend(_prefix(digest) + name for name in names)
-        for path, raw in self._read_batches(receipt, paths):
+        for path, raw in self._read_batches(receipt, paths, reader):
             _, _, digest, name = path.split('/')
             self._put(digest, name, raw)
 
@@ -275,10 +283,34 @@ class GitBundleStore:
 
     def _read(self, checkpoint=None, *, allow_stale_index=False, use_cache=False, expected_index=None):
         self._open()
+        started = time.monotonic()
+        metrics = dict(getattr(self.core, 'read_metrics', {}))
         loaded = self.core.load() if checkpoint is None else self.core.confirm(checkpoint)
+        loaded_at = time.monotonic()
+        if not use_cache:
+            self._download_metrics = {}
+        session = getattr(self.core, 'read_session', None) if not use_cache else None
+        context = session(loaded.receipt) if session else nullcontext(None)
+        with context as reader:
+            entered_at = time.monotonic()
+            result = self._read_loaded(loaded, allow_stale_index=allow_stale_index,
+                                      use_cache=use_cache, expected_index=expected_index, reader=reader)
+            exit_started = time.monotonic()
+        if not use_cache:
+            self.restore_timings.update(self._download_metrics)
+            self.restore_timings['session_initial_confirm_seconds'] = round(entered_at - loaded_at, 6)
+            self.restore_timings['session_final_confirm_seconds'] = round(time.monotonic() - exit_started, 6)
+            self.restore_timings['initial_core_load_seconds'] = round(loaded_at - started, 6)
+            self.restore_timings.update({key: round(value - metrics.get(key, 0), 6)
+                                        for key, value in getattr(self.core, 'read_metrics', {}).items()})
+            self.restore_timings['pinned_read_session'] = bool(session)
+        return result
+
+    def _read_loaded(self, loaded, *, allow_stale_index, use_cache, expected_index, reader):
         receipt = loaded.receipt
         try:
-            raw = self.core.read_files(receipt, [ARCHIVE_INDEX_PATH])[ARCHIVE_INDEX_PATH]
+            raw = (reader([ARCHIVE_INDEX_PATH]) if reader else
+                   self.core.read_files(receipt, [ARCHIVE_INDEX_PATH]))[ARCHIVE_INDEX_PATH]
             index = _index(raw)
             if self._cache is not None:
                 history = self._cache['index']['packages']
@@ -290,11 +322,13 @@ class GitBundleStore:
                 raise BundleCorrupt('Core state is newer than its archive evidence; a new bundle is required.')
             started = time.monotonic()
             reused = self._reuse(receipt, index) if use_cache else []
-            self._download(receipt, index['packages'][len(reused):])
+            self._download(receipt, index['packages'][len(reused):], reader)
             point_verified_seconds = 0.0
+            point_seeded = False
+            detail = {}
             point = index.get('restore_point')
             if point and point['package'] not in self._verified_restore_points:
-                self._download(receipt, [point['package']])
+                self._download(receipt, [point['package']], reader)
                 point_started = time.monotonic()
                 point_cache = cloud_archive.VerifiedArchiveCache()
                 if self._archive_cache._model is not None:
@@ -302,25 +336,37 @@ class GitBundleStore:
                         [self._root / d for d in index['packages']], cache=self._archive_cache)
                 checked = cloud_archive.seed_restore_point(
                     [self._root / d for d in index['packages'][:point['generation'] + 1]],
-                    self._root / point['package'], point_cache, trusted=self._archive_cache)
+                    self._root / point['package'], point_cache, trusted=self._archive_cache, timings=detail)
                 if (checked['generation'] != point['generation']
                         or checked['snapshot_sha256'] != point['snapshot_sha256']):
                     raise BundleCorrupt('Restore point does not match the original archive generation.')
                 if self._archive_cache._model is None:
                     self._archive_cache = point_cache
+                    point_seeded = True
                 self._verified_restore_points.add(point['package'])
                 point_verified_seconds = time.monotonic() - point_started
             downloaded = time.monotonic()
             verified = cloud_archive.verify_packages(
-                [self._root / digest for digest in index['packages']], cache=self._archive_cache)
+                [self._root / digest for digest in index['packages']], cache=self._archive_cache, timings=detail)
             if any(verified[key] != index[key] for key in ('manifest_sha256', 'snapshot_sha256', 'generation', 'counts')):
                 raise BundleCorrupt('Remote archive does not match its bundle index.')
             if not use_cache:
                 self.restore_timings = {'package_read_seconds': round(downloaded - started - point_verified_seconds, 6),
                                         'restore_point_verify_seconds': round(point_verified_seconds, 6),
                                         'chain_verify_seconds': round(time.monotonic() - downloaded, 6)}
+                self.restore_timings.update(detail)
+                self.restore_timings.update(archive_generation=index['generation'],
+                    startup_checkpoint_commit=receipt.commit,
+                    startup_index_sha256=_hash(raw),
+                    restore_point_package=point['package'] if point else None,
+                    restore_point_generation=point['generation'] if point else None,
+                    restore_point_used=point_seeded,
+                    indexed_tail_generations=index['generation'] - point['generation'] if point else index['generation'] + 1)
             # The final check is after local reconstruction, which can be slow.
+            confirmed_at = time.monotonic()
             self.core.confirm(receipt)
+            if not use_cache:
+                self.restore_timings['final_core_confirm_seconds'] = round(time.monotonic() - confirmed_at, 6)
             self._cache = {'receipt': receipt, 'index': index, 'raw': raw}
             if allow_stale_index:
                 # Even internal recovery must not mint a BundleReceipt whose
@@ -459,9 +505,11 @@ class GitBundleStore:
     def _restore_verified(self, target, evidence, counts):
         try:
             started = time.monotonic()
+            detail = {}
             restored = cloud_archive.restore_archive(
                 [self._root / digest for digest in self._cache['index']['packages']], target,
-                cache=self._archive_cache)
+                cache=self._archive_cache, timings=detail)
+            self.restore_timings.update({'database_' + key: value for key, value in detail.items()})
             expected = {'manifest_sha256': evidence.archive_manifest_sha256,
                         'snapshot_sha256': evidence.archive_snapshot_sha256,
                         'generation': evidence.generation, 'counts': counts}

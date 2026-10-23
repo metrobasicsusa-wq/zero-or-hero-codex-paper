@@ -81,6 +81,27 @@ snapshot and its exact hash, then replays at most 31 subsequent generations.
 Intermediate prefix snapshots are not reconstructed again; their original bytes
 and versions remain available for forensic replay. No historical package is pruned.
 The first upgrade from a legacy chain still requires a full verification.
+
+Restore instrumentation version 2026-10-23.1 records the pinned checkpoint/index,
+point generation and actual tail replay count. A cold read session fetches one
+immutable commit for bounded object batches, then confirms the current remote
+head/core again before accepting the bundle. Every original package hash and
+every tail generation's canonical snapshot hash remain checked. Tail application
+validates transitions while merging; SQLite/export comparisons still inspect all
+prior rows. Restore point frequency remains 32 generations.
+
+Timing fields distinguish Git fetch/head/object calls, package transfer/local
+writes, prefix and point decode/hash checks, model validation, tail merge/hash,
+SQLite write/readback and auxiliary/account binding. Composite phase totals and
+nested timings overlap and must not be summed as independent durations. Git
+object time includes subprocess output capture/framing; payload parse includes
+canonical serialization verification. Queue/runner times still come from Actions
+metadata. The first cycle's final persistence cannot describe itself in its own
+completed bundle: a later natural cycle archives cloud_previous_cycle_timing.
+A final job cycle may have no such later receipt; missing timings remain unknown.
+No additional flush, cycle or workflow invocation is introduced for measurement.
+Publication is pending runtime acceptance at a natural cold handoff, comparing
+last-old completion to first-new start and completion with the same baseline.
 Storage and memory still scale with history. Synthetic tests and performance figures do not
 prove real-account migration, lifetime free capacity or brokerage connectivity.
 Do not run a cloud worker alongside an existing worker.

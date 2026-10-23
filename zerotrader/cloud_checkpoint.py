@@ -25,6 +25,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 from urllib.parse import urlsplit
 
 
@@ -220,6 +221,7 @@ class GitCheckpointStore:
         self._initial_fetch_completed = False
         self._object_cache = None
         self._cache_lock = threading.RLock()
+        self.read_metrics = {}
 
     def _git_environment(self):
         env = {key: value for key, value in os.environ.items()
@@ -239,6 +241,7 @@ class GitCheckpointStore:
         timeout = self._timeout
         if args and args[0] == "fetch" and not self._initial_fetch_completed:
             timeout = max(timeout, self._initial_fetch_timeout or timeout)
+        started = time.monotonic()
         try:
             return subprocess.run(
                 [self._git_executable, "-c", "core.hooksPath=" + str(Path(directory) / "no-hooks"),
@@ -248,6 +251,12 @@ class GitCheckpointStore:
             )
         except (OSError, subprocess.SubprocessError):
             raise CheckpointError("Git operation unavailable; checkpoint was not confirmed.") from None
+        finally:
+            # Fixed operation names only: no paths, URLs, arguments or state.
+            phase = {'fetch': 'fetch', 'ls-remote': 'head', 'cat-file': 'objects'}.get(args[0] if args else '', 'other')
+            key = 'git_' + phase
+            self.read_metrics[key + '_seconds'] = self.read_metrics.get(key + '_seconds', 0.0) + time.monotonic() - started
+            self.read_metrics[key + '_calls'] = self.read_metrics.get(key + '_calls', 0) + 1
 
     def _checked(self, directory, *args, data=None):
         result = self._git(directory, *args, data=data)
@@ -370,25 +379,48 @@ class GitCheckpointStore:
             raise CheckpointCorrupt("Receipt does not match the remote checkpoint content.")
         return loaded
 
+    @contextmanager
+    def read_session(self, receipt):
+        """Bounded reads at one immutable commit; confirm before and after use.
+
+        The yielded reader is private to this context and expires on exit.
+        A changed HEAD fails the whole session before its caller can return a
+        verified bundle. This is not a write barrier or an execution lease.
+        """
+        with self._repository() as directory:
+            self.confirm(receipt)  # fetches and checks exact core/parent/hash
+            active = True
+
+            def read(paths):
+                if not active:
+                    raise CheckpointInvalid("Archive read session has ended.")
+                return self._read_files_at(directory, receipt, paths)
+
+            try:
+                yield read
+                self.confirm(receipt)
+            finally:
+                active = False
+
     def read_files(self, receipt, paths):
         """Read exact package bytes only while this receipt remains current.
 
         Package validity/reference closure is checked by the archive/bundle layer.
         No working-tree checkout, filters, symlinks or archive extraction is used.
         """
+        with self.read_session(receipt) as read:
+            return read(paths)
+
+    def _read_files_at(self, directory, receipt, paths):
         if not isinstance(paths, (list, tuple)):
             raise CheckpointInvalid("A unique list of archive paths is required.")
         for path in paths:
             _bundle_path(path)
         if len(paths) != len(set(paths)):
             raise CheckpointInvalid("A unique list of archive paths is required.")
-        self.confirm(receipt)
         result = {}
         total = 0
         with self._repository() as directory:
-            if self._head(directory) != receipt.commit:
-                raise CheckpointConflict("Checkpoint changed before archive readback.")
-            self._fetch(directory, receipt.commit)
             specs = [(receipt.commit + ":" + path).encode("ascii") for path in paths]
             request = b"".join(spec + b"\n" for spec in specs)
             # Determine all sizes before requesting content. One bounded batch
@@ -424,8 +456,6 @@ class GitCheckpointStore:
                 offset += length + 1
             if offset != len(content):
                 raise CheckpointCorrupt("Archive content has unexpected trailing bytes.")
-            if self._head(directory) != receipt.commit:
-                raise CheckpointConflict("Checkpoint changed during archive readback.")
         return result
 
     def prove_files_unchanged(self, receipt, previous_receipt, paths):

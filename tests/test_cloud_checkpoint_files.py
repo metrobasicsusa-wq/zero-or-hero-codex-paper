@@ -13,6 +13,30 @@ from zerotrader.cloud_checkpoint import (ARCHIVE_INDEX_PATH, CheckpointConflict,
 
 @unittest.skipUnless(shutil.which("git"), "Git is needed for synthetic integration tests")
 class CheckpointFilesTests(unittest.TestCase):
+    def test_pinned_session_checks_head_at_exit_without_fetching_each_batch(self):
+        receipt = self.store.bootstrap(self.state, files=self.files)
+        with patch.object(self.store, '_fetch', wraps=self.store._fetch) as fetch:
+            with self.store.read_session(receipt) as read:
+                for _ in range(5):
+                    self.assertEqual(read(list(self.files)), self.files)
+            self.assertEqual(fetch.call_count, 2)
+        with self.assertRaises(CheckpointInvalid):
+            read(list(self.files))
+
+    def test_changed_head_invalidates_whole_pinned_session(self):
+        receipt = self.store.bootstrap(self.state, files=self.files)
+        competitor = GitCheckpointStore(self.remote)
+        self.addCleanup(competitor.close)
+        with self.assertRaises(CheckpointConflict):
+            with self.store.read_session(receipt) as read:
+                self.assertEqual(read(list(self.files)), self.files)
+                competitor.commit(self.state, expected_head=receipt.commit)
+                # Pinned bytes remain consistent, but cannot be accepted when
+                # the session's final remote confirmation detects the advance.
+                self.assertEqual(read(list(self.files)), self.files)
+        with self.assertRaises(CheckpointInvalid):
+            read(list(self.files))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

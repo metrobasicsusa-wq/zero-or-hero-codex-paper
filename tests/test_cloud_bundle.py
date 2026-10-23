@@ -112,10 +112,12 @@ class CloudBundleTests(unittest.TestCase):
         target = self.root / 'fresh.sqlite3'
         fresh = self.new_bundle()
         with patch('zerotrader.cloud_bundle._READ_BATCH_FILES', 1):
-            with patch.object(fresh.core, 'read_files', wraps=fresh.core.read_files) as reads:
+            with patch.object(fresh.core, '_read_files_at', wraps=fresh.core._read_files_at) as reads:
                 loaded = fresh.restore(target)
-        self.assertTrue(all(len(call.args[1]) <= 1 for call in reads.call_args_list))
-        self.assertGreater(sum(path.endswith('.gz') for call in reads.call_args_list for path in call.args[1]), 1)
+        self.assertTrue(all(len(call.args[2]) <= 1 for call in reads.call_args_list))
+        self.assertGreater(sum(path.endswith('.gz') for call in reads.call_args_list for path in call.args[2]), 1)
+        self.assertTrue(fresh.restore_timings['pinned_read_session'])
+        self.assertEqual(fresh.restore_timings['replayed_generations'], 1)
         self.assertEqual(loaded.receipt, receipt)
         self.assertEqual(loaded.state, self.state)
         self.assertEqual(cloud_archive._source_snapshot(self.archive.path), cloud_archive._source_snapshot(target))
@@ -272,17 +274,17 @@ class CloudBundleTests(unittest.TestCase):
         current['last_cycle'] = '2026-01-02T18:00:00Z'
         latest = self.core.commit(current, expected_head=initial.commit)
         cold = self.new_bundle()
-        original = cold.core.read_files
+        original = cold.core._read_files_at
         advanced = []
 
-        def move_head_after_download(receipt, paths):
-            result = original(receipt, paths)
+        def move_head_after_download(directory, receipt, paths):
+            result = original(directory, receipt, paths)
             if any(path.endswith('.gz') for path in paths) and not advanced:
                 current['last_cycle'] = '2026-01-02T18:01:00Z'
                 advanced.append(self.core.commit(current, expected_head=latest.commit))
             return result
 
-        with patch.object(cold.core, 'read_files', side_effect=move_head_after_download):
+        with patch.object(cold.core, '_read_files_at', side_effect=move_head_after_download):
             with self.assertRaises(CheckpointConflict):
                 cold.restore_recovery(target)
         self.assertFalse(target.exists())

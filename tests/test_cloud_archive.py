@@ -17,6 +17,58 @@ from zerotrader import cloud_archive as cloud
 
 
 class CloudArchiveTests(unittest.TestCase):
+    def test_tail_validation_matches_full_comparison_and_reports_actual_replay(self):
+        baseline, _ = self.export('timing-baseline')
+        cache = cloud.VerifiedArchiveCache()
+        cloud.verify_packages([baseline], cache=cache)
+        point = self.root / 'timing-point'
+        cloud.export_restore_point(cache, point)
+        packages = [baseline]
+        for n in range(4):
+            self.archive.event(self.run, 'synthetic_tail', {'n': n})
+            if n == 3:
+                self.archive.finish_run(self.run, 'completed')
+            delta = self.root / ('timing-tail-' + str(n))
+            expected = cloud.export_archive(self.archive.path, delta, parents=packages, cache=cache)
+            packages.append(delta)
+            cloud.verify_packages(packages, cache=cache)
+        seeded = cloud.VerifiedArchiveCache()
+        detail = {}
+        cloud.seed_restore_point([baseline], point, seeded, timings=detail)
+        original = cloud._validate
+        comparisons = []
+        def double_check(model, *, previous=None, applied_rows=None):
+            original(model, previous=previous, applied_rows=applied_rows)
+            original(model, previous=previous)  # independent full old/new comparison
+            if previous is not None:
+                comparisons.append(cloud._hash(cloud._json(model)))
+        with patch.object(cloud, '_validate', side_effect=double_check):
+            actual = cloud.verify_packages(packages, cache=seeded, timings=detail)
+        self.assertEqual(actual, expected)
+        self.assertEqual(len(comparisons), 4)
+        self.assertEqual(detail['replayed_generations'], 4)
+        self.assertEqual(detail['cached_prefix_packages'], 1)
+        for key in ('tail_merge_seconds', 'tail_validation_seconds', 'tail_snapshot_hash_seconds',
+                    'prefix_chunk_hash_seconds', 'point_model_validation_seconds'):
+            self.assertGreaterEqual(detail[key], 0)
+
+    def test_tail_sequence_rewind_refused_even_above_existing_row_maximum(self):
+        with self.archive._connect() as db:
+            db.execute("UPDATE sqlite_sequence SET seq=100 WHERE name='samples'")
+        baseline, _ = self.export('sequence-baseline')
+        self.archive.event(self.run, 'tail_sequence', {'n': 1})
+        delta, _ = self.export('sequence-tail', [baseline])
+        original = cloud._read_package
+        def damaged(path, **kwargs):
+            manifest, payload, digest = original(path, **kwargs)
+            if Path(path) == delta:
+                payload['sequences'] = [[name, 99 if name == 'samples' else seq]
+                                        for name, seq in payload['sequences']]
+            return manifest, payload, digest
+        with patch.object(cloud, '_read_package', side_effect=damaged):
+            with self.assertRaisesRegex(cloud.ArchivePackageError, 'moves backwards'):
+                cloud.verify_packages([baseline, delta])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='zoh-synthetic-archive-')
         self.addCleanup(self.temp.cleanup)

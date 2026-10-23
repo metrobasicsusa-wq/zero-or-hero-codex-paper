@@ -39,7 +39,7 @@ from .risk import validate_config
 from .storage import ROOT, process_lock, read_json, write_json
 
 
-RESTORE_VERSION = "2026-10-21.1"
+RESTORE_VERSION = "2026-10-23.1"
 CODE_REPOSITORY = "metrobasicsusa-wq/zero-or-hero-codex-paper"
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _OID = re.compile(r"[0-9a-f]{40}\Z")
@@ -150,6 +150,8 @@ class CloudCoordinator:
         self.receipt, self.failed, self.evidence_ready = receipt, False, False
         self.archive_degraded = False
         self.startup_metrics = None
+        self.pending_cycle_metrics = None
+        self.cycle_metrics = {}
         self.archive, self.run_id = None, None
         if (not isinstance(receipt, CheckpointReceipt)
                 or receipt.state_sha256 != hashlib.sha256(_canonical(state)).hexdigest()):
@@ -175,9 +177,12 @@ class CloudCoordinator:
         recovered = bundle.restore_recovery(archive_path)
         recovered_at = time.monotonic()
         restore_auxiliary(archive_path, directory)
+        auxiliary_at = time.monotonic()
         result = cls(core, bundle, directory, deepcopy(recovered.state), recovered.receipt,
                      expected_account_sha256)
         result.startup_metrics = {"restore_version": RESTORE_VERSION,
+                                  "auxiliary_restore_seconds": round(auxiliary_at - recovered_at, 6),
+                                  "account_binding_seconds": round(time.monotonic() - auxiliary_at, 6),
                                   "bundle_restore_seconds": round(recovered_at - started, 6),
                                   "auxiliary_and_binding_seconds": round(time.monotonic() - recovered_at, 6),
                                   **getattr(bundle, "restore_timings", {})}
@@ -210,6 +215,13 @@ class CloudCoordinator:
         return receipt
 
     def checkpoint(self, state):
+        started = time.monotonic()
+        try:
+            return self._checkpoint(state)
+        finally:
+            self.cycle_metrics['core_persistence_seconds'] = self.cycle_metrics.get('core_persistence_seconds', 0.0) + time.monotonic() - started
+
+    def _checkpoint(self, state):
         self._available(state)
         try:
             # commit() includes exact remote readback. No automatic retry here.
@@ -220,6 +232,13 @@ class CloudCoordinator:
             raise CloudDurabilityError("Core persistence was not confirmed; execution must stop.") from None
 
     def evidence_barrier(self, state):
+        started = time.monotonic()
+        try:
+            return self._evidence_barrier(state)
+        finally:
+            self.cycle_metrics['bundle_persistence_seconds'] = self.cycle_metrics.get('bundle_persistence_seconds', 0.0) + time.monotonic() - started
+
+    def _evidence_barrier(self, state):
         self._available(state)
         if self.archive is None or self.run_id is None:
             raise AuxiliaryError("A current archive run is required for auxiliary persistence.")
@@ -290,12 +309,21 @@ class CloudCoordinator:
         self._validate_binding()
         validate_config(config)
         snapshot, engine, finished = None, None, False
+        cycle_started = time.monotonic()
+        cycle_started_at = datetime.now(timezone.utc).isoformat()
+        first_after_restore = self.startup_metrics is not None
+        self.cycle_metrics = {}
         self.archive_degraded = False
         with process_lock(self.directory):
             try:
                 try:
                     self.archive = ResearchArchive(self.directory)
                     self.run_id = self.archive.start_run("cloud_cycle", config, self.state["strategies"])
+                    if self.pending_cycle_metrics is not None:
+                        # Completed persistence can only be evidenced by a later
+                        # natural archive write; never add a cycle/flush for it.
+                        self.archive.event(self.run_id, "cloud_previous_cycle_timing", self.pending_cycle_metrics)
+                        self.pending_cycle_metrics = None
                     if self.startup_metrics is not None:
                         self.archive.event(self.run_id, "cloud_startup_timing", self.startup_metrics)
                         self.startup_metrics = None
@@ -384,7 +412,16 @@ class CloudCoordinator:
                 self.archive.event(self.run_id, "equity_observation", journal[-1])
                 self.archive.finish_run(self.run_id, "completed_with_alerts" if snapshot["alerts"] else "completed", snapshot=snapshot)
                 finished = True
+                persist_started = time.monotonic()
                 self._bundle_for(engine)  # includes final run update and all auxiliary changes
+                self.pending_cycle_metrics = {
+                    "restore_version": RESTORE_VERSION, "first_after_restore": first_after_restore,
+                    "started_at": cycle_started_at, "persistence_returned_at": datetime.now(timezone.utc).isoformat(),
+                    "cycle_including_persistence_seconds": round(time.monotonic() - cycle_started, 6),
+                    "final_bundle_seconds": round(time.monotonic() - persist_started, 6),
+                    "archive_complete": not self.archive_degraded,
+                    **{key: round(value, 6) for key, value in self.cycle_metrics.items()},
+                }
                 return {"mode": "PAPER", "status": "completed_with_alerts" if snapshot["alerts"] or self.archive_degraded else "completed",
                         "archive_complete": not self.archive_degraded,
                         "market_open": bool(snapshot["market_open"]), "paused": bool(self.state["paused"]),
